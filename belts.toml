@@ -1,0 +1,39 @@
+[Sol]
+x = 112
+y = 556
+
+[Sol.bodies.Sun]
+semi_major_axis_km = 0
+eccentricity = 0
+radius_km = 11000
+mass_kg = 1.9885E30
+
+
+[Sol.bodies.P1]
+semi_major_axis_km = 169678712.64
+eccentricity = 0
+radius_km = 11000
+mass_kg = 1.9885E28
+
+[[Sol.asteroid_belts]]
+num = 500
+# Extends from 2.06 au to 3.27 au,
+# centered around 2.665 au.
+semi_major_axis_mean_km = 398678712.64
+# Stddev of 0.25 au
+semi_major_axis_stddev = 6739950
+radius_mean_km = 50
+eccentricity_mean = 0.0
+eccentricity_stddev = 0.1
+
+
+[[Sol.bodies.P1.asteroid_belts]]
+num = 500
+# Extends from 2.06 au to 3.27 au,
+# centered around 2.665 au.
+semi_major_axis_mean_km = 1678712.64
+# Stddev of 0.25 au
+semi_major_axis_stddev = 37399
+radius_mean_km = 50
+eccentricity_mean = 0.0
+#ccentricity_stddev = 0.05
