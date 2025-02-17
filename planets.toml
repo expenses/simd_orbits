@@ -2,6 +2,13 @@
 x = 112
 y = 556
 
+[Sol.bodies.Sol]
+semi_major_axis_km = 0.0
+eccentricity = 0.0
+mass_kg = 0.0
+radius_km = 695700.0
+population = 0
+
 [Sol.bodies.Ceres]
 semi_major_axis_km = 414386496.0
 eccentricity = 0.07850000262260437
