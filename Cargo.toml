@@ -1,17 +1,28 @@
 [package]
-name = "wellwalla"
+name = "nbody"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-az = "1.2.1"
-bevy = "0.10.1"
-bevy_egui = "0.20.3"
-fixed = "1.23.1"
-log = "0.4.19"
-rand = { version = "0.8.5", features = ["small_rng"] }
-rand_distr = "0.4.3"
-serde = { version = "1.0.166", features = ["derive"] }
-toml = { version = "0.7.5", features = ["display"] }
+num-traits = "0.2.19"
+#az = "1.2.1"
+#bevy = "0.15.2"
+#bevy_egui = "0.33.0"
+#fixed = "1.28.0"
+#log = "0.4.25"
+#rand = { version = "0.9.0", features = ["small_rng"] }
+#rand_distr = "0.5.0"
+#rayon = "1.10.0"
+#serde = { version = "1.0.217", features = ["derive"] }
+#toml = { version = "0.8.20", features = ["display"] }
+#mathfun = "0.2.1"
+sleef = "0.3.2"
+
+[dev-dependencies]
+criterion = "0.3"
+
+[[bench]]
+name = "my_benchmark"
+harness = false

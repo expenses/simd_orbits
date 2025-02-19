@@ -9,7 +9,10 @@
       {
         devShells.default = with pkgs;
         mkShell rec {
-          nativeBuildInputs = [pkg-config];
+          nativeBuildInputs = [pkg-config
+clang
+            linuxPackages_latest.perf
+            hotspot];
           buildInputs = [
             udev
             alsa-lib
@@ -21,6 +24,9 @@
             libxkbcommon
             wayland # To use the wayland feature
             stdenv.cc.cc
+            simde
+            ispc
+            libclang.lib
           ];
           LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
         };
