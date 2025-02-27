@@ -1,95 +1,768 @@
 #![feature(portable_simd)]
 
-pub mod simd_orbits;
+use std::{
+    ops::Add,
+    simd::{self, LaneCount, Simd, SimdElement, SupportedLaneCount},
+};
 
-use simd_orbits::Vec3;
+// all units in meters
+// all masses in kg
 
-//mod gptorbits;
-//mod orbit_math;
-/*
-use bevy::math::DVec2;
-use bevy::{prelude::*, sprite::MaterialMesh2dBundle};
-use bevy_egui::EguiPlugin;
-use rand::{Rng, SeedableRng};
-use std::collections::{BTreeMap, HashMap};
-use std::f64::consts::TAU;
-use std::ops::{Add, AddAssign, Sub};
-
-fn main() {
-    let updates_per_sec = 1000;
-
-    App::new()
-        .insert_resource(TimeSinceStartMs(0))
-        .insert_resource(Timestep(
-            /*(60 * 60 * 24 * 30) * */ 500_000 * (1000 / updates_per_sec),
-        ))
-        //.insert_resource(FixedTime::new_from_secs(1.0 / updates_per_sec as f32))
-        .insert_resource(CameraCenter(Default::default()))
-        .add_plugins(DefaultPlugins)
-        .add_plugins(EguiPlugin)
-        .add_systems(Startup, setup)
-        .add_systems(Update, update_pos)
-        .add_systems(Update, update_ship_pos)
-        .add_systems(Update, handle_camera)
-        .add_systems(Update, update_body_scales)
-        .add_systems(Update, update_ship_scales)
-        .add_systems(Update, draw_ui)
-        .add_systems(Update, update_time)
-        .run();
+#[inline]
+fn calculate_mean_motion<T: num_traits::Float>(
+    combined_mass_div_gravitational_constant: T,
+    semi_major_axis: T,
+) -> T {
+    (combined_mass_div_gravitational_constant
+        / (semi_major_axis * semi_major_axis * semi_major_axis))
+        .sqrt()
 }
 
-#[derive(Resource)]
-struct CameraCenter(UniversalPos);
+#[inline]
+fn calculate_semi_minor_axis<T: num_traits::Float>(semi_major_axis: T, eccentricity: T) -> T {
+    semi_major_axis * (T::one() - (eccentricity * eccentricity)).sqrt()
+}
 
-#[derive(Resource)]
-struct Timestep(u64);
+// https://en.wikipedia.org/wiki/Gravitational_constant
+// in m^3 kg^-1 s^-2
+const G: f64 = 6.6743015e-11;
 
-impl Timestep {
-    fn as_secs(&self) -> f32 {
-        self.0 as f32 / 1000.0
+pub struct OrbitParamsInput<T> {
+    parent_mass: T,
+    mass: T,
+    eccentricity: T,
+    initial_mean_anomaly: T,
+    semi_major_axis: T,
+    argument_of_periapsis: T,
+}
+
+#[derive(Clone, Copy)]
+pub struct OrbitParams<T> {
+    pub mean_motion: T,
+    pub eccentricity: T,
+    pub initial_mean_anomaly: T,
+    pub semi_major_axis: T,
+    pub semi_minor_axis: T,
+    pub argument_of_periapsis_sin: T,
+    pub argument_of_periapsis_cos: T,
+    pub mass_div_gravitational_constant: T,
+}
+
+impl<T: num_traits::Float> OrbitParams<T> {
+    #[inline]
+    pub fn new(input: OrbitParamsInput<T>) -> Self {
+        Self {
+            eccentricity: input.eccentricity,
+            initial_mean_anomaly: input.initial_mean_anomaly,
+            mean_motion: calculate_mean_motion(
+                (input.parent_mass + input.mass) * T::from(G).unwrap(),
+                input.semi_major_axis,
+            ),
+            semi_major_axis: input.semi_major_axis,
+            semi_minor_axis: calculate_semi_minor_axis(input.semi_major_axis, input.eccentricity),
+            argument_of_periapsis_sin: input.argument_of_periapsis.sin(),
+            argument_of_periapsis_cos: input.argument_of_periapsis.cos(),
+            mass_div_gravitational_constant: input.mass * T::from(G).unwrap(),
+        }
+    }
+}
+
+impl<T: SimdElement, const N: usize> OrbitParams<Simd<T, N>>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    #[inline]
+    fn from_array(params: [OrbitParams<T>; N]) -> Self {
+        Self {
+            mean_motion: Simd::from_array(params.map(|param| param.mean_motion)),
+            eccentricity: Simd::from_array(params.map(|param| param.eccentricity)),
+            initial_mean_anomaly: Simd::from_array(params.map(|param| param.initial_mean_anomaly)),
+            semi_major_axis: Simd::from_array(params.map(|param| param.semi_major_axis)),
+            semi_minor_axis: Simd::from_array(params.map(|param| param.semi_minor_axis)),
+            argument_of_periapsis_sin: Simd::from_array(
+                params.map(|param| param.argument_of_periapsis_sin),
+            ),
+            argument_of_periapsis_cos: Simd::from_array(
+                params.map(|param| param.argument_of_periapsis_cos),
+            ),
+            mass_div_gravitational_constant: Simd::from_array(
+                params.map(|param| param.mass_div_gravitational_constant),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Vec3<T> {
+    pub x: T,
+    pub y: T,
+    pub z: T,
+}
+
+impl<const N: usize> Vec3<UniversalSimd<N>> {
+    fn universal_splat(value: UniversalPos) -> Self {
+        Self {
+            x: UniversalSimd([value.x; N]),
+            y: UniversalSimd([value.y; N]),
+            z: UniversalSimd([value.z; N]),
+        }
+    }
+}
+
+impl<const N: usize> From<Vec3<Simd<f64, N>>> for Vec3<UniversalSimd<N>>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    #[inline]
+    fn from(value: Vec3<Simd<f64, N>>) -> Self {
+        Self {
+            x: value.x.into(),
+            y: value.y.into(),
+            z: value.z.into(),
+        }
+    }
+}
+
+impl<T> Vec3<T> {
+    #[inline]
+    pub fn new(x: T, y: T, z: T) -> Self {
+        Self { x, y, z }
+    }
+}
+
+impl<T: SimdElement, const N: usize> Vec3<Simd<T, N>>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    #[inline]
+    fn splat(vec: Vec3<T>) -> Self {
+        Self::new(Simd::splat(vec.x), Simd::splat(vec.y), Simd::splat(vec.z))
+    }
+}
+
+impl<T: SimdElement> Vec3<Simd<T, 8>> {
+    #[inline]
+    fn swizzle_8(self, indices: [usize; 8]) -> Self {
+        Self::new(
+            swizzle_8(self.x, indices),
+            swizzle_8(self.y, indices),
+            swizzle_8(self.z, indices),
+        )
+    }
+}
+
+impl Vec3<UniversalSimd<8>> {
+    #[inline]
+    fn universal_swizzle_8(self, indices: [usize; 8]) -> Self {
+        Self::new(
+            universal_swizzle_8(self.x, indices),
+            universal_swizzle_8(self.y, indices),
+            universal_swizzle_8(self.z, indices),
+        )
+    }
+}
+
+impl<T: simd::num::SimdFloat> Vec3<T> {
+    #[inline]
+    fn reduce_sum(self) -> Vec3<T::Scalar> {
+        Vec3::new(
+            self.x.reduce_sum(),
+            self.y.reduce_sum(),
+            self.z.reduce_sum(),
+        )
+    }
+}
+
+impl<T: std::ops::Add<Output = T> + std::ops::Mul<Output = T> + Copy> Vec3<T> {
+    #[inline]
+    pub fn length_squared(&self) -> T {
+        self.x * self.x + self.y * self.y + self.z * self.z
+    }
+}
+
+impl<T: std::ops::Add<Output = T>> std::ops::Add<Self> for Vec3<T> {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, other: Self) -> Self {
+        Self {
+            x: self.x + other.x,
+            y: self.y + other.y,
+            z: self.z + other.z,
+        }
+    }
+}
+
+impl<T: std::ops::Add<Output = T> + Copy> std::ops::AddAssign for Vec3<T> {
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
+}
+
+impl<T: std::ops::Sub> std::ops::Sub<Self> for Vec3<T> {
+    type Output = Vec3<T::Output>;
+
+    #[inline]
+    fn sub(self, other: Self) -> Vec3<T::Output> {
+        Vec3 {
+            x: self.x - other.x,
+            y: self.y - other.y,
+            z: self.z - other.z,
+        }
+    }
+}
+
+impl<T: std::ops::Div<Output = T> + Copy> std::ops::Div<T> for Vec3<T> {
+    type Output = Self;
+
+    #[inline]
+    fn div(self, scalar: T) -> Self {
+        Self {
+            x: self.x / scalar,
+            y: self.y / scalar,
+            z: self.z / scalar,
+        }
+    }
+}
+
+impl<T: std::ops::Mul<Output = T> + Copy> std::ops::Mul<T> for Vec3<T> {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, scalar: T) -> Self {
+        Self {
+            x: self.x * scalar,
+            y: self.y * scalar,
+            z: self.z * scalar,
+        }
+    }
+}
+
+#[inline]
+pub fn get_acceleration_from_dir<T: FloatSimd>(dir: Vec3<T>, mu: T) -> Vec3<T::Scalar> {
+    // Needs a square root as we're trying to get the normalized direction / distance^2.
+    let mag_2 = dir.length_squared();
+    let force = dir / (mag_2 * mag_2.sqrt());
+    let accel = force * mu;
+    accel.reduce_sum()
+}
+
+#[inline]
+pub fn get_acceleration<T: FloatSimd>(
+    body_position: Vec3<T>,
+    mu: T,
+    point: Vec3<T>,
+) -> Vec3<T::Scalar> {
+    get_acceleration_from_dir(body_position - point, mu)
+}
+
+#[inline]
+pub fn get_universal_acceleration<const N: usize>(
+    body_position: Vec3<UniversalSimd<N>>,
+    mu: Simd<f64, N>,
+    point: Vec3<UniversalSimd<N>>,
+) -> Vec3<f64>
+where
+    LaneCount<N>: SupportedLaneCount,
+    Simd<f64, N>: simd::num::SimdFloat<Scalar = f64> + simd::StdFloat,
+{
+    get_acceleration_from_dir(body_position - point, mu)
+}
+
+#[inline]
+pub fn orbital_position<T: FloatSimd, SC: Fn(T) -> (T, T)>(
+    params: OrbitParams<T>,
+    time: T,
+    sincos: SC,
+) -> Vec3<T> {
+    let mean_anomaly = params.initial_mean_anomaly + params.mean_motion * time;
+    orbital_position_from_mean_anomaly(params, mean_anomaly, sincos)
+}
+
+#[inline]
+pub fn orbital_position_from_mean_anomaly<T: FloatSimd, SC: Fn(T) -> (T, T)>(
+    params: OrbitParams<T>,
+    mean_anomaly: T,
+    sincos: SC,
+) -> Vec3<T> {
+    let (_eccentric_anomaly, eccentric_anomaly_sin, eccentric_anomaly_cos) =
+        newton_raphson_kepler_simd(mean_anomaly, params.eccentricity, sincos);
+
+    let x_prime = params.semi_major_axis * (eccentric_anomaly_cos - params.eccentricity);
+    let y_prime = params.semi_minor_axis * eccentric_anomaly_sin;
+
+    let x = x_prime * params.argument_of_periapsis_cos - y_prime * params.argument_of_periapsis_sin;
+    let y = x_prime * params.argument_of_periapsis_sin + y_prime * params.argument_of_periapsis_cos;
+
+    Vec3::new(x, y, Default::default())
+}
+
+pub trait FloatSimd:
+    std::ops::Add<Output = Self>
+    + std::ops::Mul<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Div<Output = Self>
+    + std::ops::SubAssign
+    + Sized
+    + Copy
+    + simd::num::SimdFloat
+    + simd::StdFloat
+    + Default
+{
+    fn one() -> Self;
+
+    fn splat_f64(v: f64) -> Self;
+}
+
+impl<const N: usize> FloatSimd for Simd<f32, N>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    #[inline]
+    fn one() -> Self {
+        Simd::splat(1.0)
     }
 
-    fn as_secs_f64(&self) -> f64 {
-        self.0 as f64 / 1000.0
+    #[inline]
+    fn splat_f64(v: f64) -> Self {
+        Self::splat(v as f32)
+    }
+}
+impl<const N: usize> FloatSimd for Simd<f64, N>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    #[inline]
+    fn one() -> Self {
+        Simd::splat(1.0)
+    }
+
+    #[inline]
+    fn splat_f64(v: f64) -> Self {
+        Self::splat(v)
     }
 }
 
-#[derive(Resource)]
-struct TimeSinceStartMs(u64);
+#[inline]
+pub fn newton_raphson_kepler_simd<T: FloatSimd, SC: Fn(T) -> (T, T)>(
+    mean_anomaly: T,
+    eccentricity: T,
+    sincos: SC,
+) -> (T, T, T) {
+    let mut eccentric_anomaly = mean_anomaly;
+    let (eccentric_anomaly_sin, eccentric_anomaly_cos) = sincos(eccentric_anomaly);
 
-impl TimeSinceStartMs {
-    fn as_secs(&self) -> f32 {
-        self.0 as f32 / 1000.0
+    let f = eccentric_anomaly - eccentricity * eccentric_anomaly_sin - mean_anomaly;
+    let f_prime = T::one() - eccentricity * eccentric_anomaly_cos;
+    let delta = f / f_prime;
+    eccentric_anomaly -= delta;
+    let (eccentric_anomaly_sin, eccentric_anomaly_cos) = sincos(eccentric_anomaly);
+
+    let f = eccentric_anomaly - eccentricity * eccentric_anomaly_sin - mean_anomaly;
+    let f_prime = T::one() - eccentricity * eccentric_anomaly_cos;
+    let delta = f / f_prime;
+    eccentric_anomaly -= delta;
+    let (eccentric_anomaly_sin, eccentric_anomaly_cos) = sincos(eccentric_anomaly);
+
+    let f = eccentric_anomaly - eccentricity * eccentric_anomaly_sin - mean_anomaly;
+    let f_prime = T::one() - eccentricity * eccentric_anomaly_cos;
+    let delta = f / f_prime;
+    eccentric_anomaly -= delta;
+    let (eccentric_anomaly_sin, eccentric_anomaly_cos) = sincos(eccentric_anomaly);
+
+    (
+        eccentric_anomaly,
+        eccentric_anomaly_sin,
+        eccentric_anomaly_cos,
+    )
+}
+
+#[inline]
+fn join_universal_lanes(a: UniversalSimd<8>, b: UniversalSimd<8>) -> UniversalSimd<16> {
+    let mut c = [Default::default(); 16];
+    c[..8].copy_from_slice(&a[..]);
+    c[8..].copy_from_slice(&b[..]);
+    UniversalSimd(c)
+}
+
+#[inline]
+fn join_universal_vec3s(
+    a: Vec3<UniversalSimd<8>>,
+    b: Vec3<UniversalSimd<8>>,
+) -> Vec3<UniversalSimd<16>> {
+    Vec3::new(
+        join_universal_lanes(a.x, b.x),
+        join_universal_lanes(a.y, b.y),
+        join_universal_lanes(a.z, b.z),
+    )
+}
+
+#[inline]
+fn join_lanes(a: Simd<f64, 8>, b: Simd<f64, 8>) -> Simd<f64, 16> {
+    let mut c = Simd::default();
+    c.as_mut_array()[..8].copy_from_slice(a.as_array());
+    c.as_mut_array()[8..].copy_from_slice(b.as_array());
+    c
+}
+
+#[inline]
+fn join_vec3s(a: Vec3<Simd<f64, 8>>, b: Vec3<Simd<f64, 8>>) -> Vec3<Simd<f64, 16>> {
+    Vec3::new(
+        join_lanes(a.x, b.x),
+        join_lanes(a.y, b.y),
+        join_lanes(a.z, b.z),
+    )
+}
+
+#[derive(Clone, Copy)]
+pub struct UniversalSimd<const N: usize>([UniversalScalar; N]);
+
+impl<const N: usize> Default for UniversalSimd<N> {
+    fn default() -> Self {
+        Self([Default::default(); N])
+    }
+}
+
+impl<const N: usize> std::ops::Add<Self> for UniversalSimd<N> {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self::Output {
+        UniversalSimd(std::array::from_fn(|i| self[i] + rhs[i]))
+    }
+}
+
+impl<const N: usize> std::ops::Sub<Self> for UniversalSimd<N>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    type Output = Simd<f64, N>;
+
+    #[inline]
+    fn sub(self, rhs: Self) -> Self::Output {
+        Simd::from_array(std::array::from_fn(|i| (self[i] - rhs[i]).cast()))
+    }
+}
+
+impl<const N: usize> std::ops::Deref for UniversalSimd<N> {
+    type Target = [UniversalScalar; N];
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> From<Simd<f64, N>> for UniversalSimd<N>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    #[inline]
+    fn from(value: Simd<f64, N>) -> Self {
+        Self(std::array::from_fn(|i| UniversalScalar::from_num(value[i])))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SystemState {
+    star_mass_div_gravitational_constant: f64,
+    planet_and_moon_positions: Vec3<Simd<f64, 16>>,
+    planet_and_moon_gravitation: Simd<f64, 16>,
+}
+
+#[derive(Clone, Copy)]
+pub struct UniversalSystemState {
+    star_mass_div_gravitational_constant: f64,
+    planet_and_moon_positions: Vec3<UniversalSimd<16>>,
+    planet_and_moon_gravitation: Simd<f64, 16>,
+}
+
+impl UniversalSystemState {
+    #[inline]
+    pub fn acceleration_at(&self, point: UniversalPos) -> Vec3<f64> {
+        get_universal_acceleration::<1>(
+            Vec3::default(),
+            Simd::splat_f64(self.star_mass_div_gravitational_constant),
+            Vec3::universal_splat(point),
+        ) + get_universal_acceleration(
+            self.planet_and_moon_positions,
+            self.planet_and_moon_gravitation,
+            Vec3::universal_splat(point),
+        )
+    }
+}
+
+impl SystemState {
+    #[inline]
+    pub fn acceleration_at(&self, point: Vec3<f64>) -> Vec3<f64> {
+        get_acceleration::<Simd<f64, 1>>(
+            Vec3::default(),
+            Simd::splat_f64(self.star_mass_div_gravitational_constant),
+            Vec3::splat(point),
+        ) + get_acceleration(
+            self.planet_and_moon_positions,
+            self.planet_and_moon_gravitation,
+            Vec3::splat(point),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct System {
+    star_mass_div_gravitational_constant: f64,
+    planets: OrbitParams<Simd<f64, 8>>,
+    moons: OrbitParams<Simd<f64, 8>>,
+    moon_parent_swizzles: [usize; 8],
+}
+
+impl System {
+    #[inline]
+    pub fn sol() -> Self {
+        let sol_mass_kg = 1.9885E30;
+        let earth_mass = 5972167981508606000000000.0;
+        let jupiter_mass = 1898200070271041200000000000.0;
+
+        let planets = OrbitParams::from_array([
+            // Mercury
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: sol_mass_kg,
+                mass: 330109997604976300000000.0,
+                eccentricity: 0.20563000440597534,
+                semi_major_axis: 57_909_048_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Venus
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: sol_mass_kg,
+                mass: 48674999312183700000000000.0,
+                eccentricity: 0.006771999876946211,
+                semi_major_axis: 108_208_000_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Earth
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: sol_mass_kg,
+                mass: earth_mass,
+                eccentricity: 0.016708599403500557,
+                initial_mean_anomaly: 0.0,
+                semi_major_axis: 149_598_016_000.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Mars
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: sol_mass_kg,
+                mass: 641709984568677800000000.0,
+                eccentricity: 0.0934000015258789,
+                semi_major_axis: 227_939_360_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Jupiter
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: sol_mass_kg,
+                mass: jupiter_mass,
+                eccentricity: 0.048900000751018524,
+                semi_major_axis: 778_000_000_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Saturn
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: sol_mass_kg,
+                mass: 568340015946830600000000000.0,
+                eccentricity: 0.05649999901652336,
+                semi_major_axis: 1_433_529_984_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Uranus
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: sol_mass_kg,
+                mass: 86809999452623640000000000.0,
+                eccentricity: 0.0471699982881546,
+                semi_major_axis: 2_870_971_904_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Neptune
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: sol_mass_kg,
+                mass: 102413002683302160000000000.0,
+                eccentricity: 0.008678000420331955,
+                semi_major_axis: 4_499_999_744_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+        ]);
+
+        let moons = OrbitParams::from_array([
+            // Luna
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: earth_mass,
+                mass: 73420000479201920000000.0,
+                eccentricity: 0.05490000173449516,
+                semi_major_axis: 384_399_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Luna
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: earth_mass,
+                mass: 73420000479201920000000.0,
+                eccentricity: 0.05490000173449516,
+                semi_major_axis: 384_399_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Luna
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: earth_mass,
+                mass: 73420000479201920000000.0,
+                eccentricity: 0.05490000173449516,
+                semi_major_axis: 384_399_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Callisto
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: jupiter_mass,
+                mass: 107593796336849370000000.0,
+                eccentricity: 0.007400000002235174,
+                semi_major_axis: 1_882_700_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Luna
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: earth_mass,
+                mass: 73420000479201920000000.0,
+                eccentricity: 0.05490000173449516,
+                semi_major_axis: 384_399_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Luna
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: earth_mass,
+                mass: 73420000479201920000000.0,
+                eccentricity: 0.05490000173449516,
+                semi_major_axis: 384_399_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Luna
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: earth_mass,
+                mass: 73420000479201920000000.0,
+                eccentricity: 0.05490000173449516,
+                semi_major_axis: 384_399_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Luna
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: earth_mass,
+                mass: 73420000479201920000000.0,
+                eccentricity: 0.05490000173449516,
+                semi_major_axis: 384_399_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+        ]);
+
+        Self {
+            star_mass_div_gravitational_constant: sol_mass_kg * G,
+            planets,
+            moons,
+            moon_parent_swizzles: [2, 2, 2, 4, 2, 2, 2, 2],
+        }
     }
 
-    fn as_secs_f64(&self) -> f64 {
-        self.0 as f64 / 1000.0
+    #[inline]
+    pub fn state_at(&self, time: f64) -> SystemState {
+        let planet_positions =
+            orbital_position(self.planets, Simd::splat(time), sleef::f64x::sincos_u35);
+
+        let mut moon_positions =
+            orbital_position(self.moons, Simd::splat(time), sleef::f64x::sincos_u35);
+
+        moon_positions += planet_positions.swizzle_8(self.moon_parent_swizzles);
+
+        SystemState {
+            star_mass_div_gravitational_constant: self.star_mass_div_gravitational_constant,
+            planet_and_moon_positions: join_vec3s(planet_positions, moon_positions),
+            planet_and_moon_gravitation: join_lanes(
+                self.planets.mass_div_gravitational_constant,
+                self.moons.mass_div_gravitational_constant,
+            ),
+        }
+    }
+
+    #[inline]
+    pub fn universal_state_at(&self, time: f64) -> UniversalSystemState {
+        let planet_positions = Vec3::<UniversalSimd<8>>::from(orbital_position(
+            self.planets,
+            Simd::splat(time),
+            sleef::f64x::sincos_u35,
+        ));
+
+        let mut moon_positions = Vec3::<UniversalSimd<8>>::from(orbital_position(
+            self.moons,
+            Simd::splat(time),
+            sleef::f64x::sincos_u35,
+        ));
+
+        moon_positions += planet_positions.universal_swizzle_8(self.moon_parent_swizzles);
+
+        UniversalSystemState {
+            star_mass_div_gravitational_constant: self.star_mass_div_gravitational_constant,
+            planet_and_moon_positions: join_universal_vec3s(planet_positions, moon_positions),
+            planet_and_moon_gravitation: join_lanes(
+                self.planets.mass_div_gravitational_constant,
+                self.moons.mass_div_gravitational_constant,
+            ),
+        }
     }
 }
 
-fn is_zero_u64(t: &u64) -> bool {
-    *t == 0
+/*fn erydanos_sin_cos(v: Simd<f64, 8>) -> (Simd<f64, 8>, Simd<f64, 8>) {
+    use erydanos::{_mm256_cos_pd, _mm256_sin_pd};
+    use std::arch::x86_64::__m256d;
+
+    let arr = v.to_array();
+
+    unsafe {
+        let low = std::mem::transmute::<[f64; 4], __m256d>([arr[0], arr[1], arr[2], arr[3]]);
+        let high = std::mem::transmute::<[f64; 4], __m256d>([arr[4], arr[5], arr[6], arr[7]]);
+
+        let sin_low = _mm256_sin_pd(low);
+        let sin_high = _mm256_sin_pd(high);
+
+        let cos_low = _mm256_cos_pd(low);
+        let cos_high = _mm256_cos_pd(high);
+
+        (
+            Simd::from_array(std::mem::transmute([sin_low, sin_high])),
+            Simd::from_array(std::mem::transmute([cos_low, cos_high])),
+        )
+    }
+}*/
+
+#[inline]
+fn swizzle_8<T: SimdElement>(a: Simd<T, 8>, indices: [usize; 8]) -> Simd<T, 8> {
+    Simd::from_array(std::array::from_fn(|i| a[indices[i]]))
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct SerializedBody {
-    semi_major_axis_km: f64,
-    eccentricity: f64,
-    mass_kg: f64,
-    radius_km: f64,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    satelites: HashMap<String, SerializedBody>,
-    periapsis_rotation_r: Option<f64>,
+#[inline]
+fn universal_swizzle_8(a: UniversalSimd<8>, indices: [usize; 8]) -> UniversalSimd<8> {
+    UniversalSimd(std::array::from_fn(|i| a[indices[i]]))
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct System {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    bodies: BTreeMap<String, SerializedBody>,
-    x: u64,
-    y: u64,
-}
-*/
+#[test]
+fn testing() {}
+
 type UniversalScalar = fixed::types::I108F20;
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -101,9 +774,10 @@ pub struct UniversalPos {
 
 use az::Cast;
 
-use std::ops::{Add, AddAssign, Div, Mul, Sub};
+use std::ops::{AddAssign, Sub};
 
 impl UniversalPos {
+    #[inline]
     pub fn new_3(x: f64, y: f64, z: f64) -> Self {
         Self::new(
             UniversalScalar::from_num(x),
@@ -112,22 +786,35 @@ impl UniversalPos {
         )
     }
 
+    #[inline]
     pub fn new(x: UniversalScalar, y: UniversalScalar, z: UniversalScalar) -> Self {
         Self { x, y, z }
     }
 
+    #[inline]
     pub fn distance_squared(self, other: Self) -> f64 {
         (self - other).length_squared()
     }
 
+    #[inline]
     pub fn distance(self, other: Self) -> f64 {
         self.distance_squared(other).sqrt()
+    }
+
+    #[inline]
+    pub fn relative_to(self, other: Self) -> Self {
+        Self {
+            x: (self.x - other.x),
+            y: (self.y - other.y),
+            z: (self.z - other.z),
+        }
     }
 }
 
 impl Add<Vec3<f64>> for UniversalPos {
     type Output = Self;
 
+    #[inline]
     fn add(self, other: Vec3<f64>) -> Self {
         Self {
             x: self.x + UniversalScalar::from_num(other.x),
@@ -138,6 +825,7 @@ impl Add<Vec3<f64>> for UniversalPos {
 }
 
 impl AddAssign<Vec3<f64>> for UniversalPos {
+    #[inline]
     fn add_assign(&mut self, other: Vec3<f64>) {
         *self = *self + other;
     }
@@ -146,6 +834,7 @@ impl AddAssign<Vec3<f64>> for UniversalPos {
 impl Sub<UniversalPos> for UniversalPos {
     type Output = Vec3<f64>;
 
+    #[inline]
     fn sub(self, other: Self) -> Vec3<f64> {
         Vec3 {
             x: (self.x - other.x).cast(),
@@ -154,301 +843,3 @@ impl Sub<UniversalPos> for UniversalPos {
         }
     }
 }
-/*
-// In meters.
-#[derive(Component)]
-struct Radius(pub f64);
-
-#[derive(Component)]
-struct Position(UniversalPos);
-
-#[derive(Component)]
-struct Velocity(DVec2);
-
-#[derive(Component)]
-struct SateliteOf(Entity);
-
-#[derive(Component, Clone, Copy)]
-struct OrbitalParams {
-    semi_major_axis_m: f32,
-    eccentricity: f32,
-    mass_kg: f32,
-    periapsis_rotation_r: f32,
-    initial_offset_r: f32,
-}
-
-struct Context<'a> {
-    commands: Commands<'a, 'a>,
-    meshes: &'a mut Assets<Mesh>,
-    materials: &'a mut Assets<ColorMaterial>,
-    rng: rand::rngs::SmallRng,
-    positions_and_mus: Vec<(OrbitalParams, Option<OrbitalParams>, f64)>,
-}
-
-fn spawn_body(
-    name: &str,
-    body: &SerializedBody,
-    satelite_of: Option<(Entity, OrbitalParams)>,
-    context: &mut Context,
-) {
-    let circle_mesh = context.meshes.add(Circle::new(1.0));
-
-    let params = OrbitalParams {
-        semi_major_axis_m: (body.semi_major_axis_km * 1000.0) as f32,
-        eccentricity: body.eccentricity as _,
-        periapsis_rotation_r: body
-            .periapsis_rotation_r
-            .unwrap_or_else(|| context.rng.gen_range(0.0..TAU)) as _,
-        initial_offset_r: context.rng.gen_range(0.0..TAU) as _,
-        mass_kg: body.mass_kg as _,
-    };
-
-    context.positions_and_mus.push((
-        params,
-        satelite_of.as_ref().map(|&(_, b)| b),
-        params.mass_kg as f64 * (G as f64),
-    ));
-
-    let mut entity_commands = context.commands.spawn((
-        Mesh2d(circle_mesh.clone()),
-        MeshMaterial2d(context
-            .materials
-            .add(bevy::prelude::ColorMaterial::from(Color::from(if satelite_of.is_none() {
-                bevy::color::palettes::basic::RED
-            } else {
-                bevy::color::palettes::basic::PURPLE
-            })))),
-        params,
-        Radius(body.radius_km * 1000.0),
-        Name::new(name.to_string()),
-    ));
-
-    if let Some((parent, _)) = satelite_of {
-        entity_commands.insert(SateliteOf(parent));
-    }
-
-    let entity = entity_commands.id();
-
-    for (name, body) in body.satelites.iter() {
-        spawn_body(name, body, Some((entity, params)), context);
-    }
-}
-
-fn setup(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-) {
-    let rng = rand::rngs::SmallRng::from_seed([0; 32]);
-
-    let mut camera = Camera2dBundle::default();
-    camera.projection.scale = 200_000_000.0;
-    //camera.camera_2d.clear_color =
-    //    bevy::core_pipeline::clear_color::ClearColorConfig::Custom(Color::BLACK);
-    commands.spawn(camera);
-
-    let x: BTreeMap<String, System> =
-        toml::from_str(&std::fs::read_to_string("planets.toml").unwrap())
-            .unwrap_or_else(|err| panic!("{}", err));
-
-    let mut context = Context {
-        commands,
-        meshes: &mut meshes,
-        materials: &mut materials,
-        rng,
-        positions_and_mus: Default::default(),
-    };
-
-    for (_name, system) in x {
-        for (name, body) in system.bodies.iter() {
-            spawn_body(name, body, None, &mut context);
-        }
-    }
-
-    let mut pos = UniversalPos::new_2(149_598_016.0 * 1000.0, 0.0);
-    let mut velocity = DVec2::new(0.0, 100.0);
-    for d in 0..10_u32 {
-        for t in 0..60 * 60 * 24 {
-            let t = (60 * 60 * 24 * d) + t;
-            let acceleration = get_acceleration(&context.positions_and_mus, pos.as_dvec2(), t as _);
-            velocity += acceleration;
-            pos += velocity;
-        }
-        dbg!(d);
-    }
-
-    dbg!(pos, velocity);
-    //panic!();
-}
-
-const C: f64 = 299_792_458.0;
-const G: f64 = 9.80665;
-const LY: f64 = 9.4607E15;
-
-fn fix_time(t: f64) -> f64 {
-    t / 60.0 / 60.0 / 24.0 / 365.25
-}
-
-fn fix_distance(d: f64) -> f64 {
-    d / 9.4607E15
-}
-
-fn handle_camera(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    mut proj: Query<&mut bevy::render::camera::OrthographicProjection>,
-    mut camera_center: ResMut<CameraCenter>,
-) {
-    let mut proj = proj.single_mut();
-
-    if keyboard.pressed(KeyCode::KeyT) {
-        proj.scale /= 1.0 + (1.0 * time.delta_secs());
-    }
-
-    if keyboard.pressed(KeyCode::KeyG) {
-        proj.scale *= 1.0 + (1.0 * time.delta_secs());
-    }
-
-    let movement_speed = UniversalScalar::from_num(proj.scale * 200.0 * time.delta_secs());
-
-    if keyboard.pressed(KeyCode::KeyL) {
-        camera_center.0.x += movement_speed;
-    }
-
-    if keyboard.pressed(KeyCode::KeyJ) {
-        camera_center.0.x -= movement_speed;
-    }
-
-    if keyboard.pressed(KeyCode::KeyI) {
-        camera_center.0.y += movement_speed;
-    }
-
-    if keyboard.pressed(KeyCode::KeyK) {
-        camera_center.0.y -= movement_speed;
-    }
-}
-
-fn update_body_scales(
-    mut query: Query<(&mut Transform, &Radius)>,
-    proj: Query<&bevy::render::camera::OrthographicProjection>,
-) {
-    let proj = proj.single();
-
-    for (mut transform, radius) in query.iter_mut() {
-        transform.scale = Vec3::splat((radius.0 as f32).max(proj.scale * 1.5));
-    }
-}
-
-fn update_ship_scales(
-    mut query: Query<&mut Transform, With<Position>>,
-    proj: Query<&bevy::render::camera::OrthographicProjection>,
-) {
-    let proj = proj.single();
-
-    for mut transform in query.iter_mut() {
-        transform.scale = Vec3::splat(proj.scale * 3.0);
-    }
-}
-
-fn update_time(time_since_start: ResMut<TimeSinceStartMs>, timestep: Res<Timestep>) {
-    //time_since_start.0 += timestep.0;
-}
-
-fn update_ship_pos(
-    mut query: Query<(&mut Transform, &Position)>,
-    camera_center: Res<CameraCenter>,
-) {
-    for (mut transform, position) in query.iter_mut() {
-        transform.translation = (position.0 - camera_center.0).as_vec2().extend(0.2);
-    }
-}
-
-fn update_pos(
-    mut query: Query<(&OrbitalParams, Option<&SateliteOf>, &mut Transform)>,
-    param_query: Query<&OrbitalParams>,
-    time_since_start: Res<TimeSinceStartMs>,
-    camera_center: Res<CameraCenter>,
-) {
-    for (params, satelite_of, mut transform) in query.iter_mut() {
-        let pos = calc_pos_with_parent(
-            *params,
-            satelite_of.map(|parent| *param_query.get(parent.0).unwrap()),
-            time_since_start.as_secs(),
-        );
-        let pos_z = if satelite_of.is_some() { 0.1 } else { 0.0 };
-
-        transform.translation = (pos - camera_center.0.as_dvec2()).as_vec2().extend(pos_z);
-    }
-}
-
-#[inline(never)]
-fn calc_pos(params: OrbitalParams, parent_mass_kg: f32, time: f32) -> DVec2 {
-    if params.semi_major_axis_m == 0.0 {
-        return Default::default();
-    }
-
-    DVec2::from(gptorbits::orbital_position(
-        params.semi_major_axis_m as _,
-        params.eccentricity as _,
-        params.periapsis_rotation_r as _,
-        params.initial_offset_r as _,
-        parent_mass_kg as _,
-        time as _,
-        5e-10 as _,
-    ))
-    //.as_dvec2()
-}
-
-#[inline(never)]
-fn calc_pos_with_parent(
-    params: OrbitalParams,
-    satelite_of: Option<OrbitalParams>,
-    time: f32,
-) -> DVec2 {
-    let sol_mass_kg = 1.9885E30 * 0.0898;
-
-    match satelite_of {
-        Some(parent_params) => {
-            let parent_pos = calc_pos(parent_params, sol_mass_kg, time);
-
-            let pos = calc_pos(params, parent_params.mass_kg, time);
-
-            parent_pos + pos
-        }
-        None => calc_pos(params, sol_mass_kg, time),
-    }
-}
-
-pub fn get_acceleration(
-    positions_and_mus: &[(OrbitalParams, Option<OrbitalParams>, f64)],
-    position: DVec2,
-    time: f32,
-) -> DVec2 {
-    positions_and_mus
-        .iter()
-        .map(|&(orbit, parent_orbit, mu)| {
-            let body_position = calc_pos_with_parent(orbit, parent_orbit, time);
-            let dir = body_position - position;
-            let mag_2 = dir.length_squared();
-            let force = dir / (mag_2 * mag_2.sqrt());
-            force * mu
-        })
-        .sum()
-}
-
-fn draw_ui(mut contexts: bevy_egui::EguiContexts, time_since_start: Res<TimeSinceStartMs>) {
-    let ctx = contexts.ctx_mut();
-
-    bevy_egui::egui::Window::new("Ships").show(&*ctx, |ui| {
-        ui.label(format!(
-            "Days: {:.2}",
-            time_since_start.as_secs_f64() / 60.0 / 60.0 / 24.0
-        ));
-    });
-}
-
-// in km^3 s^-2 or some shit.
-fn calculate_mu(mass_in_kg: f64) -> f64 {
-    mass_in_kg * G / 1_000_000_000.0
-}
- */

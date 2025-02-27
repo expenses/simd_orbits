@@ -2,8 +2,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use nbody::simd_orbits::*;
-use nbody::UniversalPos;
+use nbody::*;
 use std::simd::{LaneCount, Simd, SimdElement, StdFloat, SupportedLaneCount};
 
 use criterion::BenchmarkId;
@@ -84,37 +83,17 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     bench_group::<f64, 32, _>(c, sin_cos_sequential, 0.1, 0.2);
     bench_group::<f64, 64, _>(c, sin_cos_sequential, 0.1, 0.2);
 
-    let system = System::new();
-
-    c.bench_function("calculate_acceleration_for_system", |b| {
-        b.iter(|| {
-            calculate_acceleration_for_system(
-                system,
-                black_box(Vec3::new(100000.0, 100000.0, 100000.0)),
-                black_box(10.0),
-            )
-        })
-    });
-
-    c.bench_function("calculate_acceleration_for_system_64", |b| {
-        b.iter(|| {
-            let mut pos = black_box(Vec3::new(100000.0, 100000.0, 100000.0));
-            let mut vel = black_box(Vec3::new(100000.0, 100000.0, 100000.0));
-
-            calculate_acceleration_for_system_64(system, &mut pos, &mut vel, black_box(10.0))
-        })
-    });
+    let system = System::sol();
 
     c.bench_function("1_000_000", |b| {
         b.iter(|| {
             let mut position = black_box(Vec3::new(100000.0, 100000.0, 100000.0));
             let mut velocity = black_box(Vec3::new(1000.0, 0.0, 0.0));
-            let mut initial_time = black_box(36666.3);
+            let initial_time = black_box(36666.3);
 
             for i in 0..1_000_000 {
                 let state = system.state_at(initial_time + i as f64);
-                velocity += state.acceleration_at(position)
-                    + state.acceleration_at(position + Vec3::new(1.0, 1.0, 1.0));
+                velocity += state.acceleration_at(position);
                 position += velocity;
             }
         })
@@ -124,17 +103,27 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let mut position = black_box(UniversalPos::new_3(100000.0, 100000.0, 100000.0));
             let mut velocity = black_box(Vec3::new(1000.0, 0.0, 0.0));
-            let mut initial_time = black_box(36666.3);
+            let initial_time = black_box(36666.3);
             let star_position = black_box(UniversalPos::default());
-            let star_position2 = black_box(UniversalPos::new_3(100000e20, 0.0, 0.0));
 
             for i in 0..1_000_000 {
-                let accel = calculate_acceleration_for_system(
-                    system,
-                    position - star_position,
-                    initial_time + i as f64,
-                );
-                velocity += accel;
+                let state = system.state_at(initial_time + i as f64);
+                velocity += state.acceleration_at(position - star_position);
+                position += velocity;
+            }
+        })
+    });
+
+    c.bench_function("1_000_000_univ", |b| {
+        b.iter(|| {
+            let mut position = black_box(UniversalPos::new_3(100000.0, 100000.0, 100000.0));
+            let mut velocity = black_box(Vec3::new(1000.0, 0.0, 0.0));
+            let initial_time = black_box(36666.3);
+            let star_position = black_box(UniversalPos::default());
+
+            for i in 0..1_000_000 {
+                let state = system.universal_state_at(initial_time + i as f64);
+                velocity += state.acceleration_at(position.relative_to(star_position));
                 position += velocity;
             }
         })
@@ -156,25 +145,6 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             }
         })
     });*/
-
-    c.bench_function("1_year", |b| {
-        b.iter(|| {
-            let mut position = black_box(UniversalPos::new_3(100000.0, 100000.0, 100000.0));
-            let mut velocity = black_box(Vec3::new(1000.0, 0.0, 0.0));
-            let mut initial_time = black_box(36666.3);
-            let system_pos = black_box(UniversalPos::default());
-
-            for i in 0..60 * 60 * 24 * 365 {
-                let accel = calculate_acceleration_for_system(
-                    system,
-                    position - system_pos,
-                    initial_time + i as f64,
-                );
-                velocity += accel;
-                position += velocity;
-            }
-        })
-    });
 
     /*c.bench_function("abc", |b| {
         b.iter(|| {
