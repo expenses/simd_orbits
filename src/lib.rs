@@ -2,6 +2,8 @@
 
 pub mod simd_orbits;
 
+use simd_orbits::Vec3;
+
 //mod gptorbits;
 //mod orbit_math;
 /*
@@ -37,7 +39,7 @@ fn main() {
 }
 
 #[derive(Resource)]
-struct CameraCenter(FixedVec2);
+struct CameraCenter(UniversalPos);
 
 #[derive(Resource)]
 struct Timestep(u64);
@@ -87,85 +89,78 @@ struct System {
     x: u64,
     y: u64,
 }
-
-type FixedScalar = fixed::types::I108F20;
+*/
+type UniversalScalar = fixed::types::I108F20;
 
 #[derive(Clone, Copy, Default, Debug)]
-struct FixedVec2 {
-    x: FixedScalar,
-    y: FixedScalar,
+pub struct UniversalPos {
+    pub x: UniversalScalar,
+    pub y: UniversalScalar,
+    pub z: UniversalScalar,
 }
 
 use az::Cast;
 
-impl FixedVec2 {
-    fn new_2(x: f64, y: f64) -> Self {
-        Self::new(FixedScalar::from_num(x), FixedScalar::from_num(y))
+use std::ops::{Add, AddAssign, Div, Mul, Sub};
+
+impl UniversalPos {
+    pub fn new_3(x: f64, y: f64, z: f64) -> Self {
+        Self::new(
+            UniversalScalar::from_num(x),
+            UniversalScalar::from_num(y),
+            UniversalScalar::from_num(z),
+        )
     }
 
-    fn new(x: FixedScalar, y: FixedScalar) -> Self {
-        Self { x, y }
+    pub fn new(x: UniversalScalar, y: UniversalScalar, z: UniversalScalar) -> Self {
+        Self { x, y, z }
     }
 
-    fn distance_squared(self, other: Self) -> f64 {
+    pub fn distance_squared(self, other: Self) -> f64 {
         (self - other).length_squared()
     }
 
-    fn distance(self, other: Self) -> f64 {
+    pub fn distance(self, other: Self) -> f64 {
         self.distance_squared(other).sqrt()
     }
-
-    fn as_dvec2(self) -> DVec2 {
-        DVec2 {
-            x: self.x.cast(),
-            y: self.y.cast(),
-        }
-    }
-
-    // This is essentially an add, but discouraged unless there's a good reason
-    // (like treating one position as an orbit around another).
-    fn offset_by_pos(self, other: Self) -> Self {
-        Self {
-            x: self.x + other.x,
-            y: self.y + other.y,
-        }
-    }
 }
 
-impl Add<DVec2> for FixedVec2 {
+impl Add<Vec3<f64>> for UniversalPos {
     type Output = Self;
 
-    fn add(self, other: DVec2) -> Self {
+    fn add(self, other: Vec3<f64>) -> Self {
         Self {
-            x: self.x + FixedScalar::from_num(other.x),
-            y: self.y + FixedScalar::from_num(other.y),
+            x: self.x + UniversalScalar::from_num(other.x),
+            y: self.y + UniversalScalar::from_num(other.y),
+            z: self.z + UniversalScalar::from_num(other.z),
         }
     }
 }
 
-impl AddAssign<DVec2> for FixedVec2 {
-    fn add_assign(&mut self, other: DVec2) {
+impl AddAssign<Vec3<f64>> for UniversalPos {
+    fn add_assign(&mut self, other: Vec3<f64>) {
         *self = *self + other;
     }
 }
 
-impl Sub<FixedVec2> for FixedVec2 {
-    type Output = DVec2;
+impl Sub<UniversalPos> for UniversalPos {
+    type Output = Vec3<f64>;
 
-    fn sub(self, other: Self) -> DVec2 {
-        DVec2 {
+    fn sub(self, other: Self) -> Vec3<f64> {
+        Vec3 {
             x: (self.x - other.x).cast(),
             y: (self.y - other.y).cast(),
+            z: (self.z - other.z).cast(),
         }
     }
 }
-
+/*
 // In meters.
 #[derive(Component)]
 struct Radius(pub f64);
 
 #[derive(Component)]
-struct Position(FixedVec2);
+struct Position(UniversalPos);
 
 #[derive(Component)]
 struct Velocity(DVec2);
@@ -270,7 +265,7 @@ fn setup(
         }
     }
 
-    let mut pos = FixedVec2::new_2(149_598_016.0 * 1000.0, 0.0);
+    let mut pos = UniversalPos::new_2(149_598_016.0 * 1000.0, 0.0);
     let mut velocity = DVec2::new(0.0, 100.0);
     for d in 0..10_u32 {
         for t in 0..60 * 60 * 24 {
@@ -314,7 +309,7 @@ fn handle_camera(
         proj.scale *= 1.0 + (1.0 * time.delta_secs());
     }
 
-    let movement_speed = FixedScalar::from_num(proj.scale * 200.0 * time.delta_secs());
+    let movement_speed = UniversalScalar::from_num(proj.scale * 200.0 * time.delta_secs());
 
     if keyboard.pressed(KeyCode::KeyL) {
         camera_center.0.x += movement_speed;

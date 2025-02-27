@@ -6,18 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+az = "1.2.1"
+fixed = "1.28.0"
 num-traits = "0.2.19"
-#az = "1.2.1"
-#bevy = "0.15.2"
-#bevy_egui = "0.33.0"
-#fixed = "1.28.0"
-#log = "0.4.25"
-#rand = { version = "0.9.0", features = ["small_rng"] }
-#rand_distr = "0.5.0"
-#rayon = "1.10.0"
-#serde = { version = "1.0.217", features = ["derive"] }
-#toml = { version = "0.8.20", features = ["display"] }
-#mathfun = "0.2.1"
 sleef = "0.3.2"
 
 [dev-dependencies]
