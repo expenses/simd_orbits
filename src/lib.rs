@@ -149,6 +149,11 @@ where
     LaneCount<N>: SupportedLaneCount,
 {
     #[inline]
+    pub fn get(self, index: usize) -> Vec3<T> {
+        Vec3::new(self.x[index], self.y[index], self.z[index])
+    }
+
+    #[inline]
     fn splat(vec: Vec3<T>) -> Self {
         Self::new(Simd::splat(vec.x), Simd::splat(vec.y), Simd::splat(vec.z))
     }
@@ -309,7 +314,7 @@ pub fn orbital_position_from_mean_anomaly<T: FloatSimd, SC: Fn(T) -> (T, T)>(
     let x = x_prime * params.argument_of_periapsis_cos - y_prime * params.argument_of_periapsis_sin;
     let y = x_prime * params.argument_of_periapsis_sin + y_prime * params.argument_of_periapsis_cos;
 
-    Vec3::new(x, y, Default::default())
+    Vec3::new(x, Default::default(), y)
 }
 
 pub trait FloatSimd:
@@ -789,6 +794,12 @@ pub struct UniversalPos {
 use az::Cast;
 
 use std::ops::{AddAssign, Sub};
+
+impl From<Vec3<f64>> for UniversalPos {
+    fn from(vec: Vec3<f64>) -> Self {
+        Self::new_3(vec.x, vec.y, vec.z)
+    }
+}
 
 impl UniversalPos {
     #[inline]
