@@ -72,7 +72,7 @@ where
     LaneCount<N>: SupportedLaneCount,
 {
     #[inline]
-    fn from_array(params: [OrbitParams<T>; N]) -> Self {
+    pub fn from_array(params: [OrbitParams<T>; N]) -> Self {
         Self {
             mean_motion: Simd::from_array(params.map(|param| param.mean_motion)),
             eccentricity: Simd::from_array(params.map(|param| param.eccentricity)),
@@ -88,6 +88,20 @@ where
             mass_div_gravitational_constant: Simd::from_array(
                 params.map(|param| param.mass_div_gravitational_constant),
             ),
+        }
+    }
+
+    #[inline]
+    pub fn get(self, index: usize) -> OrbitParams<T> {
+        OrbitParams {
+            mean_motion: self.mean_motion[index],
+            eccentricity: self.eccentricity[index],
+            initial_mean_anomaly: self.initial_mean_anomaly[index],
+            semi_major_axis: self.semi_major_axis[index],
+            semi_minor_axis: self.semi_minor_axis[index],
+            argument_of_periapsis_sin: self.argument_of_periapsis_sin[index],
+            argument_of_periapsis_cos: self.argument_of_periapsis_cos[index],
+            mass_div_gravitational_constant: self.mass_div_gravitational_constant[index],
         }
     }
 }
@@ -465,9 +479,9 @@ where
 
 #[derive(Clone, Copy)]
 pub struct SystemState {
-    star_mass_div_gravitational_constant: f64,
-    planet_and_moon_positions: Vec3<Simd<f64, 16>>,
-    planet_and_moon_gravitation: Simd<f64, 16>,
+    pub star_mass_div_gravitational_constant: f64,
+    pub planet_and_moon_positions: Vec3<Simd<f64, 16>>,
+    pub planet_and_moon_gravitation: Simd<f64, 16>,
 }
 
 #[derive(Clone, Copy)]
@@ -509,10 +523,10 @@ impl SystemState {
 
 #[derive(Clone, Copy)]
 pub struct System {
-    star_mass_div_gravitational_constant: f64,
-    planets: OrbitParams<Simd<f64, 8>>,
-    moons: OrbitParams<Simd<f64, 8>>,
-    moon_parent_swizzles: [usize; 8],
+    pub star_mass_div_gravitational_constant: f64,
+    pub planets: OrbitParams<Simd<f64, 8>>,
+    pub moons: OrbitParams<Simd<f64, 8>>,
+    pub moon_parent_swizzles: [usize; 8],
 }
 
 impl System {
@@ -809,6 +823,11 @@ impl UniversalPos {
             z: (self.z - other.z),
         }
     }
+
+    #[inline]
+    pub fn as_vec3(self) -> Vec3<f64> {
+        Vec3::new(self.x.cast(), self.y.cast(), self.z.cast())
+    }
 }
 
 impl Add<Vec3<f64>> for UniversalPos {
@@ -836,10 +855,11 @@ impl Sub<UniversalPos> for UniversalPos {
 
     #[inline]
     fn sub(self, other: Self) -> Vec3<f64> {
-        Vec3 {
-            x: (self.x - other.x).cast(),
-            y: (self.y - other.y).cast(),
-            z: (self.z - other.z).cast(),
+        Self {
+            x: self.x - other.x,
+            y: self.y - other.y,
+            z: self.z - other.z,
         }
+        .as_vec3()
     }
 }

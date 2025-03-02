@@ -1,8 +1,8 @@
 #![feature(portable_simd)]
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use nbody::*;
+use nbody_simd::*;
 use std::simd::{LaneCount, Simd, SimdElement, StdFloat, SupportedLaneCount};
 
 use criterion::BenchmarkId;
