@@ -71,6 +71,7 @@
               echo ${binaryen}/bin/wasm-opt -Oz -o $out/bev_bg.wasm $out/bev_bg.wasm
               ${binaryen}/bin/wasm-opt -Oz -o $out/bev_bg.wasm $out/bev_bg.wasm
               cp ${./index.html} $out/index.html
+              cp -r ${./assets} $out/assets
             '';
           };
       }

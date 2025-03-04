@@ -2,7 +2,7 @@
 
 use std::{
     ops::Add,
-    simd::{self, LaneCount, Simd, SimdElement, SupportedLaneCount},
+    simd::{self, LaneCount, Mask, MaskElement, Simd, SimdElement, SupportedLaneCount},
 };
 
 // all units in meters
@@ -27,6 +27,7 @@ fn calculate_semi_minor_axis<T: num_traits::Float>(semi_major_axis: T, eccentric
 // in m^3 kg^-1 s^-2
 const G: f64 = 6.6743015e-11;
 
+#[derive(Clone, Copy)]
 pub struct OrbitParamsInput<T> {
     parent_mass: T,
     mass: T,
@@ -262,9 +263,25 @@ impl<T: std::ops::Mul<Output = T> + Copy> std::ops::Mul<T> for Vec3<T> {
 pub fn get_acceleration_from_dir<T: FloatSimd>(dir: Vec3<T>, mu: T) -> Vec3<T::Scalar> {
     // Needs a square root as we're trying to get the normalized direction / distance^2.
     let mag_2 = dir.length_squared();
-    let force = dir / (mag_2 * mag_2.sqrt());
-    let accel = force * mu;
+    let normalized_dir_div_dist_squared = dir / (mag_2 * mag_2.sqrt());
+    let accel = normalized_dir_div_dist_squared * mu;
     accel.reduce_sum()
+}
+
+#[inline]
+pub fn collides_at_distance<T: FloatSimd>(distance: Vec3<T>, body_radius_squared: T) -> bool {
+    (distance.length_squared())
+        .simd_le(body_radius_squared)
+        .any()
+}
+
+#[inline]
+pub fn collides<T: FloatSimd>(
+    body_position: Vec3<T>,
+    body_radius_squared: T,
+    point: Vec3<T>,
+) -> bool {
+    collides_at_distance(body_position - point, body_radius_squared)
 }
 
 #[inline]
@@ -317,6 +334,19 @@ pub fn orbital_position_from_mean_anomaly<T: FloatSimd, SC: Fn(T) -> (T, T)>(
     Vec3::new(x, Default::default(), y)
 }
 
+pub trait SimdMask {
+    fn any(self) -> bool;
+}
+
+impl<T: MaskElement, const N: usize> SimdMask for Mask<T, N>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    fn any(self) -> bool {
+        Mask::any(self)
+    }
+}
+
 pub trait FloatSimd:
     std::ops::Add<Output = Self>
     + std::ops::Mul<Output = Self>
@@ -327,8 +357,12 @@ pub trait FloatSimd:
     + Copy
     + simd::num::SimdFloat
     + simd::StdFloat
+    + std::simd::cmp::SimdPartialEq<Mask = <Self as FloatSimd>::Mask>
+    + std::simd::cmp::SimdPartialOrd
     + Default
 {
+    type Mask: SimdMask;
+
     fn one() -> Self;
 
     fn splat_f64(v: f64) -> Self;
@@ -338,6 +372,8 @@ impl<const N: usize> FloatSimd for Simd<f32, N>
 where
     LaneCount<N>: SupportedLaneCount,
 {
+    type Mask = Mask<<f32 as SimdElement>::Mask, N>;
+
     #[inline]
     fn one() -> Self {
         Simd::splat(1.0)
@@ -352,6 +388,8 @@ impl<const N: usize> FloatSimd for Simd<f64, N>
 where
     LaneCount<N>: SupportedLaneCount,
 {
+    type Mask = Mask<<f64 as SimdElement>::Mask, N>;
+
     #[inline]
     fn one() -> Self {
         Simd::splat(1.0)
@@ -487,6 +525,33 @@ pub struct SystemState {
     pub star_mass_div_gravitational_constant: f64,
     pub planet_and_moon_positions: Vec3<Simd<f64, 16>>,
     pub planet_and_moon_gravitation: Simd<f64, 16>,
+    pub star_radius_sq: Simd<f64, 1>,
+    pub planet_and_moon_radius_sq: Simd<f64, 16>,
+}
+
+impl SystemState {
+    #[inline]
+    pub fn collides(&self, point: Vec3<f64>) -> bool {
+        collides_at_distance(Vec3::<Simd<f64, 1>>::splat(point), self.star_radius_sq)
+            || collides(
+                self.planet_and_moon_positions,
+                self.planet_and_moon_radius_sq,
+                Vec3::splat(point),
+            )
+    }
+
+    #[inline]
+    pub fn acceleration_at(&self, point: Vec3<f64>) -> Vec3<f64> {
+        get_acceleration::<Simd<f64, 1>>(
+            Vec3::default(),
+            Simd::splat_f64(self.star_mass_div_gravitational_constant),
+            Vec3::splat(point),
+        ) + get_acceleration(
+            self.planet_and_moon_positions,
+            self.planet_and_moon_gravitation,
+            Vec3::splat(point),
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -511,191 +576,210 @@ impl UniversalSystemState {
     }
 }
 
-impl SystemState {
-    #[inline]
-    pub fn acceleration_at(&self, point: Vec3<f64>) -> Vec3<f64> {
-        get_acceleration::<Simd<f64, 1>>(
-            Vec3::default(),
-            Simd::splat_f64(self.star_mass_div_gravitational_constant),
-            Vec3::splat(point),
-        ) + get_acceleration(
-            self.planet_and_moon_positions,
-            self.planet_and_moon_gravitation,
-            Vec3::splat(point),
-        )
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct System {
     pub star_mass_div_gravitational_constant: f64,
     pub planets: OrbitParams<Simd<f64, 8>>,
     pub moons: OrbitParams<Simd<f64, 8>>,
     pub moon_parent_swizzles: [usize; 8],
+    pub star_radius_sq: Simd<f64, 1>,
+    pub planet_and_moon_radius_sq: Simd<f64, 16>,
 }
 
 impl System {
-    #[inline]
-    pub fn sol() -> Self {
-        let sol_mass_kg = 1.9885E30;
-        let earth_mass = 5972167981508606000000000.0;
-        let jupiter_mass = 1898200070271041200000000000.0;
+    pub const SOL_MASS_KG: f64 = 1.9885E30;
+    pub const SOL_RADIUS: f64 = 6.957E8;
 
-        let planets = OrbitParams::from_array([
-            // Mercury
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: sol_mass_kg,
+    pub const SOL_PLANET_INPUTS: [(OrbitParamsInput<f64>, f64); 8] = [
+        // Mercury
+        (
+            OrbitParamsInput {
+                parent_mass: Self::SOL_MASS_KG,
                 mass: 330109997604976300000000.0,
                 eccentricity: 0.20563000440597534,
                 semi_major_axis: 57_909_048_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
-            }),
-            // Venus
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: sol_mass_kg,
+            },
+            2_439_700.0,
+        ),
+        // Venus
+        (
+            OrbitParamsInput {
+                parent_mass: Self::SOL_MASS_KG,
                 mass: 48674999312183700000000000.0,
                 eccentricity: 0.006771999876946211,
                 semi_major_axis: 108_208_000_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
-            }),
-            // Earth
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: sol_mass_kg,
-                mass: earth_mass,
+            },
+            6_051_800.0,
+        ),
+        // Earth
+        (
+            OrbitParamsInput {
+                parent_mass: Self::SOL_MASS_KG,
+                mass: 5972167981508606000000000.0,
                 eccentricity: 0.016708599403500557,
                 initial_mean_anomaly: 0.0,
                 semi_major_axis: 149_598_016_000.0,
                 argument_of_periapsis: 0.0,
-            }),
-            // Mars
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: sol_mass_kg,
+            },
+            6_371_000.0,
+        ),
+        // Mars
+        (
+            OrbitParamsInput {
+                parent_mass: Self::SOL_MASS_KG,
                 mass: 641709984568677800000000.0,
                 eccentricity: 0.0934000015258789,
                 semi_major_axis: 227_939_360_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
-            }),
-            // Jupiter
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: sol_mass_kg,
-                mass: jupiter_mass,
+            },
+            3_389_500.0,
+        ),
+        // Jupiter
+        (
+            OrbitParamsInput {
+                parent_mass: Self::SOL_MASS_KG,
+                mass: 1898200070271041200000000000.0,
                 eccentricity: 0.048900000751018524,
                 semi_major_axis: 778_000_000_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
-            }),
-            // Saturn
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: sol_mass_kg,
+            },
+            69_911_000.0,
+        ),
+        // Saturn
+        (
+            OrbitParamsInput {
+                parent_mass: Self::SOL_MASS_KG,
                 mass: 568340015946830600000000000.0,
                 eccentricity: 0.05649999901652336,
                 semi_major_axis: 1_433_529_984_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
-            }),
-            // Uranus
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: sol_mass_kg,
+            },
+            69_911_000.0,
+        ),
+        // Uranus
+        (
+            OrbitParamsInput {
+                parent_mass: Self::SOL_MASS_KG,
                 mass: 86809999452623640000000000.0,
                 eccentricity: 0.0471699982881546,
                 semi_major_axis: 2_870_971_904_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
-            }),
-            // Neptune
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: sol_mass_kg,
+            },
+            69_911_000.0,
+        ),
+        // Neptune
+        (
+            OrbitParamsInput {
+                parent_mass: Self::SOL_MASS_KG,
                 mass: 102413002683302160000000000.0,
                 eccentricity: 0.008678000420331955,
                 semi_major_axis: 4_499_999_744_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
-            }),
-        ]);
+            },
+            69_911_000.0,
+        ),
+    ];
+
+    #[inline]
+    pub fn sol() -> Self {
+        let planets = OrbitParams::from_array(
+            Self::SOL_PLANET_INPUTS.map(|(input, _)| OrbitParams::new(input)),
+        );
 
         let moons = OrbitParams::from_array([
             // Luna
             OrbitParams::new(OrbitParamsInput {
-                parent_mass: earth_mass,
+                parent_mass: Self::SOL_PLANET_INPUTS[2].0.mass,
                 mass: 73420000479201920000000.0,
                 eccentricity: 0.05490000173449516,
                 semi_major_axis: 384_399_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
             }),
-            // Luna
+            // Phobos
             OrbitParams::new(OrbitParamsInput {
-                parent_mass: earth_mass,
-                mass: 73420000479201920000000.0,
-                eccentricity: 0.05490000173449516,
-                semi_major_axis: 384_399_000.0,
+                parent_mass: Self::SOL_PLANET_INPUTS[3].0.mass,
+                mass: 1.060E16,
+                eccentricity: 0.0151,
+                semi_major_axis: 9_376_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
             }),
-            // Luna
+            // Deimos
             OrbitParams::new(OrbitParamsInput {
-                parent_mass: earth_mass,
-                mass: 73420000479201920000000.0,
-                eccentricity: 0.05490000173449516,
-                semi_major_axis: 384_399_000.0,
+                parent_mass: Self::SOL_PLANET_INPUTS[3].0.mass,
+                mass: 1.51E15,
+                eccentricity: 0.00033,
+                semi_major_axis: 23_463_200.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Io
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: Self::SOL_PLANET_INPUTS[4].0.mass,
+                mass: 8.931938E22,
+                eccentricity: 0.0040313019,
+                semi_major_axis: 421_700_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Europa
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: Self::SOL_PLANET_INPUTS[4].0.mass,
+                mass: 4.79984E22,
+                eccentricity: 0.009,
+                semi_major_axis: 670_900_000.0,
+                initial_mean_anomaly: 0.0,
+                argument_of_periapsis: 0.0,
+            }),
+            // Ganymede
+            OrbitParams::new(OrbitParamsInput {
+                parent_mass: Self::SOL_PLANET_INPUTS[4].0.mass,
+                mass: 1.4819E23,
+                eccentricity: 0.0013,
+                semi_major_axis: 1_070_400_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
             }),
             // Callisto
             OrbitParams::new(OrbitParamsInput {
-                parent_mass: jupiter_mass,
-                mass: 107593796336849370000000.0,
-                eccentricity: 0.007400000002235174,
+                parent_mass: Self::SOL_PLANET_INPUTS[4].0.mass,
+                mass: 1.075938E23,
+                eccentricity: 0.0074,
                 semi_major_axis: 1_882_700_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
             }),
-            // Luna
+            // Titan
             OrbitParams::new(OrbitParamsInput {
-                parent_mass: earth_mass,
-                mass: 73420000479201920000000.0,
-                eccentricity: 0.05490000173449516,
-                semi_major_axis: 384_399_000.0,
-                initial_mean_anomaly: 0.0,
-                argument_of_periapsis: 0.0,
-            }),
-            // Luna
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: earth_mass,
-                mass: 73420000479201920000000.0,
-                eccentricity: 0.05490000173449516,
-                semi_major_axis: 384_399_000.0,
-                initial_mean_anomaly: 0.0,
-                argument_of_periapsis: 0.0,
-            }),
-            // Luna
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: earth_mass,
-                mass: 73420000479201920000000.0,
-                eccentricity: 0.05490000173449516,
-                semi_major_axis: 384_399_000.0,
-                initial_mean_anomaly: 0.0,
-                argument_of_periapsis: 0.0,
-            }),
-            // Luna
-            OrbitParams::new(OrbitParamsInput {
-                parent_mass: earth_mass,
-                mass: 73420000479201920000000.0,
-                eccentricity: 0.05490000173449516,
-                semi_major_axis: 384_399_000.0,
+                parent_mass: Self::SOL_PLANET_INPUTS[5].0.mass,
+                mass: 1.34518E23,
+                eccentricity: 0.0288,
+                semi_major_axis: 1_221_870_000.0,
                 initial_mean_anomaly: 0.0,
                 argument_of_periapsis: 0.0,
             }),
         ]);
 
         Self {
-            star_mass_div_gravitational_constant: sol_mass_kg * G,
+            star_mass_div_gravitational_constant: Self::SOL_MASS_KG * G,
             planets,
             moons,
-            moon_parent_swizzles: [2, 2, 2, 4, 2, 2, 2, 2],
+            moon_parent_swizzles: [2, 3, 3, 4, 4, 4, 4, 5],
+            star_radius_sq: Simd::splat_f64(Self::SOL_RADIUS * Self::SOL_RADIUS),
+            planet_and_moon_radius_sq: join_lanes(
+                Simd::from_array(Self::SOL_PLANET_INPUTS.map(|(_, radius)| radius * radius)),
+                Simd::from_array(Self::SOL_PLANET_INPUTS.map(|(_, radius)| radius * radius)),
+            ),
         }
     }
 
@@ -716,6 +800,8 @@ impl System {
                 self.planets.mass_div_gravitational_constant,
                 self.moons.mass_div_gravitational_constant,
             ),
+            star_radius_sq: self.star_radius_sq,
+            planet_and_moon_radius_sq: self.planet_and_moon_radius_sq,
         }
     }
 
