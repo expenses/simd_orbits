@@ -5,6 +5,8 @@ use std::{
     simd::{self, LaneCount, Mask, MaskElement, Simd, SimdElement, SupportedLaneCount},
 };
 
+pub use sleef;
+
 // all units in meters
 // all masses in kg
 

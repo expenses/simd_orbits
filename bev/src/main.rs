@@ -5,7 +5,7 @@ use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, egui};
 use bevy_polyline::prelude::*;
-use nbody_simd::{OrbitParams, UniversalPos};
+use nbody_simd::{OrbitParams, UniversalPos, sleef};
 
 #[derive(Resource, Default)]
 struct SystemTime(f64);

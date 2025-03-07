@@ -1,0 +1,11 @@
+[package]
+name = "bev"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.15.3", features = ["jpeg"] }
+bevy_egui = "0.33.0"
+bevy_polyline = "0.11.0"
+nbody-simd = {path = ".."}
+ordered-float = "5.0.0"

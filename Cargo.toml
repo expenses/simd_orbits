@@ -7,18 +7,14 @@ edition = "2024"
 az = "1.2.1"
 fixed = "1.28.0"
 num-traits = "0.2.19"
-ordered-float = "5.0.0"
 sleef = "0.3.2"
 
 [dev-dependencies]
-bevy = { version = "0.15.3", features = ["jpeg"] }
-bevy_egui = "0.33.0"
-bevy_polyline = "0.11.0"
 criterion = "0.3"
 
 [[bench]]
 name = "my_benchmark"
 harness = false
 
-[profile.release]
-opt-level = 'z'
+[workspace]
+members = [".", "bev"]
