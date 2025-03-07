@@ -822,20 +822,20 @@ impl System {
         index: usize,
         time: Simd<f64, 64>,
     ) -> Vec3<Simd<f64, 64>> {
-        let body = OrbitParams::from_array([self.planets.get(index); 64]);
-
-        let pos = orbital_position::<Simd<f64, 64>, _>(body, time, sleef::f64x::sincos_u35);
-
         if index < 8 {
-            pos
+            let body = OrbitParams::from_array([self.planets.get(index); 64]);
+            orbital_position::<Simd<f64, 64>, _>(body, time, sleef::f64x::sincos_u35)
         } else {
-            let parent = self.moon_parent_swizzles[index];
+            let body = OrbitParams::from_array([self.moons.get(index - 8); 64]);
 
-            (pos + orbital_position::<Simd<f64, 64>, _>(
-                OrbitParams::from_array([self.planets.get(parent); 64]),
-                time,
-                sleef::f64x::sincos_u35,
-            ))
+            let parent = self.moon_parent_swizzles[index - 8];
+
+            (orbital_position::<Simd<f64, 64>, _>(body, time, sleef::f64x::sincos_u35)
+                + orbital_position::<Simd<f64, 64>, _>(
+                    OrbitParams::from_array([self.planets.get(parent); 64]),
+                    time,
+                    sleef::f64x::sincos_u35,
+                ))
         }
     }
 

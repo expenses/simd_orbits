@@ -1,4 +1,10 @@
-#![feature(portable_simd)]
+#![feature(portable_simd, mpmc_channel)]
+
+mod paths;
+mod ui;
+
+use paths::*;
+use ui::update_ui;
 
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::math::DVec3;
@@ -43,7 +49,8 @@ impl UniversalCamera {
     }
 
     fn rotate_yaw_pitch(&mut self, yaw: f32, pitch: f32) {
-        self.pitch += (pitch as f64) / 100.0;
+        self.pitch =
+            (self.pitch + (pitch as f64) / 100.0).clamp(std::f64::EPSILON, std::f64::consts::PI);
         self.yaw += (yaw as f64) / 100.0;
     }
 }
@@ -105,7 +112,7 @@ fn main() {
                 update_camera,
                 get_closest_path_point.after(update_camera),
                 update_ui,
-                recalulate_burns.after(update_ui),
+                receive_trajectories.after(update_ui),
             ),
         )
         .run();
@@ -234,74 +241,6 @@ fn get_reference_frame_offset(
             ))
         .as_array()
     })
-}
-
-fn set_ship_path_positions(
-    camera: Res<UniversalCamera>,
-    mut polylines: ResMut<Assets<Polyline>>,
-    paths: Query<(&ShipPath, &PolylineHandle)>,
-    settings: Res<PathSettings>,
-    system: Res<System>,
-    reference_frame: Res<ReferenceFrameBody>,
-) {
-    for (path, handle) in paths.iter() {
-        let line = polylines.get_mut(&handle.0).unwrap();
-        line.vertices.clear();
-
-        let decimation: usize = settings.decimation;
-        let system_system: nbody_simd::System = system.system;
-
-        let reference_frame_at_time = reference_frame
-            .0
-            .into_iter()
-            .flat_map(|body| {
-                get_reference_frame_offset(path.start, &system, body, settings.decimation)
-            })
-            .chain(std::iter::repeat(Default::default()));
-
-        let mut time = path.start;
-
-        for (point, ref_offset) in path
-            .positions
-            .iter()
-            .step_by(settings.decimation)
-            .zip(reference_frame_at_time)
-            .take(settings.max_segments / settings.decimation)
-        {
-            let mut pos = *point - camera.position;
-            pos += ref_offset;
-
-            line.vertices
-                // Move the lines closer to the camera for better stability on opengl.
-                .push(convert_vec(pos / SCALE).as_vec3());
-
-            time += 10.0 * settings.decimation as f64;
-        }
-    }
-}
-fn set_path_positions(
-    camera: Res<UniversalCamera>,
-    mut polylines: ResMut<Assets<Polyline>>,
-    system: Res<System>,
-    query: Query<(&ComputedPath, &PolylineHandle, Option<&ParentBody>)>,
-) {
-    let positions = system.state.planet_and_moon_positions;
-
-    for (ComputedPath(path), handle, parent) in query.iter() {
-        let line = polylines.get_mut(&handle.0).unwrap();
-        line.vertices.clear();
-        let parent_pos = convert_vec(
-            parent
-                .map(|&ParentBody(parent)| positions.get(parent))
-                .unwrap_or_default(),
-        );
-        for point in path {
-            let pos = (parent_pos + point) - convert_vec(camera.position.as_vec3());
-            line.vertices
-                // Move the lines closer to the camera for better stability on opengl.
-                .push((pos / SCALE).as_vec3());
-        }
-    }
 }
 
 fn set_positions(
@@ -580,174 +519,11 @@ fn handle_mouse_scroll(
     }
 }
 
-fn update_ui(
-    mut contexts: EguiContexts,
-    mut followed: ResMut<FollowedBody>,
-    mut reference_frame: ResMut<ReferenceFrameBody>,
-    mut time: ResMut<SystemTime>,
-    mut burns: Query<(Entity, &mut Burn)>,
-    mut commands: Commands,
-    mut path_settings: ResMut<PathSettings>,
-    system_bodies: Query<(&Name, &SystemBody)>,
-) {
-    egui::Window::new("Hello").show(contexts.ctx_mut(), |ui| {
-        ui.add(egui::Slider::new(&mut path_settings.decimation, 1..=10_000));
-        ui.add(egui::Slider::new(
-            &mut path_settings.max_segments,
-            1..=10_000_000,
-        ));
-        ui.add(egui::Slider::new(&mut time.0, 0.0..=100_000_000.0));
-
-        for (entity, mut burn) in burns.iter_mut() {
-            ui.label("Burn");
-            if ui.button("delete").clicked() {
-                commands.entity(entity).despawn();
-            }
-            burn.dirty |= ui
-                .add(egui::Slider::new(
-                    &mut burn.vector.x,
-                    -100_000.0..=100_000.0_f64,
-                ))
-                .changed();
-            burn.dirty |= ui
-                .add(egui::Slider::new(
-                    &mut burn.vector.y,
-                    -100_000.0..=100_000.0_f64,
-                ))
-                .changed();
-            burn.dirty |= ui
-                .add(egui::Slider::new(
-                    &mut burn.vector.z,
-                    -100_000.0..=100_000.0_f64,
-                ))
-                .changed();
-        }
-
-        if ui.button("None").clicked() {
-            followed.0 = None;
-        }
-        if ui.button("No Ref").clicked() {
-            reference_frame.0 = None;
-        }
-
-        for (name, body) in system_bodies.iter() {
-            ui.horizontal(|ui| {
-                if ui.button(&**name).clicked() {
-                    followed.0 = Some(body.0);
-                }
-                if ui.button("Set ref").clicked() {
-                    reference_frame.0 = Some(body.0);
-                }
-            });
-        }
-    });
-}
-
 #[derive(Component)]
 struct ShipPathBefore;
 
 #[derive(Component)]
 struct ShipPathAfter;
-
-fn get_closest_path_point(
-    mut contexts: EguiContexts,
-    camera: Res<UniversalCamera>,
-    render_cam: Single<(&Camera, &GlobalTransform)>,
-    paths: Query<&ShipPath>,
-    mut time: ResMut<SystemTime>,
-    primary_window: Option<Single<&Window>>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    mut polyline_materials: ResMut<Assets<PolylineMaterial>>,
-    mut polylines: ResMut<Assets<Polyline>>,
-    mut commands: Commands,
-    settings: Res<PathSettings>,
-    reference_frame: Res<ReferenceFrameBody>,
-    system: Res<System>,
-) {
-    if contexts.ctx_mut().is_using_pointer() {
-        return;
-    }
-
-    let mut cursor_position =
-        if let Some(cursor_position) = primary_window.and_then(|window| window.cursor_position()) {
-            cursor_position
-        } else {
-            return;
-        };
-
-    let (render_cam, render_cam_transform) = *render_cam;
-
-    let cone_dir =
-        if let Ok(ray) = render_cam.viewport_to_world(render_cam_transform, cursor_position) {
-            ray
-        } else {
-            return;
-        }
-        .direction
-        .as_vec3()
-        .as_dvec3();
-
-    let compare_dist = 20.0;
-    let step = 10;
-
-    let picked_position = paths
-        .iter()
-        .flat_map(|path| {
-            let reference_frame_at_time = reference_frame
-                .0
-                .into_iter()
-                .flat_map(|body| get_reference_frame_offset(path.start, &system, body, step))
-                .chain(std::iter::repeat(Default::default()));
-
-            path.positions
-                .iter()
-                .enumerate()
-                .step_by(step)
-                .map(move |(i, pos)| (i, path, pos))
-                .zip(reference_frame_at_time)
-                .take(settings.max_segments)
-        })
-        .map(|((i, path, &pos), ref_offset)| {
-            let relative = convert_vec((pos - camera.position) + ref_offset);
-            let dir = relative.normalize();
-            let closeness = dir.dot(cone_dir);
-            (i, path, closeness)
-        })
-        .max_by_key(|&(_, _, cosine_angle)| ordered_float::OrderedFloat(cosine_angle))
-        .filter(|&(_, _, cosine_angle)| cosine_angle > 0.9995);
-
-    if let Some((index, origin_path, x)) = picked_position {
-        if buttons.just_pressed(MouseButton::Left) {
-            let start = index as f64 * 10.0 + origin_path.start;
-            if reference_frame.0.is_none() {
-                time.0 = start;
-            }
-            let vel = origin_path.velocities[index];
-            let pos = origin_path.positions[index];
-            commands.spawn((
-                ShipPath {
-                    start,
-                    velocities: vec![vel],
-                    positions: vec![pos],
-                },
-                Burn {
-                    vector: Default::default(),
-                    dirty: false,
-                },
-                PolylineBundle {
-                    polyline: PolylineHandle(polylines.add(Polyline::default())),
-                    material: PolylineMaterialHandle(polyline_materials.add(PolylineMaterial {
-                        width: 1.0,
-                        color: Color::hsl(90.0, 1.0, 0.5).to_linear(),
-                        perspective: false,
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-            ));
-        }
-    }
-}
 
 #[derive(Component)]
 struct ShipPath {
@@ -759,30 +535,120 @@ struct ShipPath {
 #[derive(Component)]
 struct Burn {
     vector: nbody_simd::Vec3<f64>,
-    dirty: bool,
 }
 
-fn recalulate_burns(mut query: Query<(&mut Burn, &mut ShipPath)>, system: Res<System>) {
-    for (mut burn, mut path) in query.iter_mut() {
-        if !burn.dirty {
-            continue;
-        }
-        burn.dirty = false;
+fn receive_trajectories(
+    mut query: Query<(&mut ShipPath, &TrajectoryReceiver)>,
+    settings: Res<PathSettings>,
+) {
+    for (mut path, recv) in query.iter_mut() {
+        for (round, positions, velocities, collides) in recv.inner.try_iter() {
+            if round != recv.expected_round {
+                path.positions.clear();
+                path.velocities.clear();
+                continue;
+            }
 
-        let mut pos = path.positions[0];
-        let mut vel = path.velocities[0] + burn.vector;
-        path.positions.truncate(1);
-        path.velocities.truncate(1);
+            path.positions.extend_from_slice(&positions);
+            path.velocities.extend_from_slice(&velocities);
+        }
+    }
+}
+
+#[derive(Component)]
+struct TrajectoryReceiver {
+    expected_round: usize,
+    inner: Receiver<(usize, Vec<UniversalPos>, Vec<nbody_simd::Vec3<f64>>, bool)>,
+}
+
+#[derive(Component)]
+struct BurnTx(Sender<(nbody_simd::Vec3<f64>, usize)>);
+
+use std::sync::mpmc::{Receiver, Sender, sync_channel};
+
+fn trajectory_calculator(
+    output: Sender<(usize, Vec<UniversalPos>, Vec<nbody_simd::Vec3<f64>>, bool)>,
+    commands: Receiver<(nbody_simd::Vec3<f64>, usize)>,
+    start: f64,
+    starting_pos: UniversalPos,
+    starting_vel: nbody_simd::Vec3<f64>,
+    system: nbody_simd::System,
+) {
+    let mut pos = starting_pos;
+    let mut vel = starting_vel;
+    let mut iteration = 0;
+    let mut round = 0;
+    let mut wait_for_next = false;
+
+    loop {
+        if wait_for_next {
+            let (burn, new_round) = commands.recv().unwrap();
+            pos = starting_pos;
+            vel = starting_vel + burn;
+            iteration = 0;
+            round = new_round;
+            wait_for_next = false;
+        }
+
+        while let Ok((burn, new_round)) = commands.try_recv() {
+            pos = starting_pos;
+            vel = starting_vel + burn;
+            iteration = 0;
+            round = new_round;
+        }
+
+        //dbg!(());
+
+        let mut positions = vec![Default::default(); 10240];
+        let mut velocities = vec![Default::default(); 10240];
+
         let timestep = 10.0;
-        for i in 0..1_000_000 {
-            let state = system.system.state_at(i as f64 * timestep + path.start);
+        let mut collides = false;
+        for i in 0..10240 {
+            positions[i] = pos;
+            velocities[i] = vel;
+
+            let state = system.state_at((iteration + i) as f64 * timestep + start);
             if state.collides(pos.as_vec3()) {
+                collides = true;
+                positions.truncate(i + 1);
+                velocities.truncate(i + 1);
                 break;
             }
             vel += state.acceleration_at(pos.as_vec3()) * timestep;
             pos += vel * timestep;
-            path.positions.push(pos);
-            path.velocities.push(vel);
         }
+        iteration += 10240;
+        output.send((round, positions, velocities, collides));
+
+        wait_for_next = iteration > 1024 * 1024 || collides;
     }
+}
+
+#[test]
+fn test_trajectory_thread() {
+    let (output_tx, output_rx) = sync_channel(100);
+    let (burn_tx, burn_rx) = sync_channel(100);
+    let pos = UniversalPos::new_3(57_909_048_000.0 / 2.0, 0.0, 0.0);
+    let vel = nbody_simd::Vec3::new(0.0, 0.0, 100000.0);
+
+    std::thread::spawn(move || {
+        trajectory_calculator(output_tx, burn_rx, 0.0, pos, vel, nbody_simd::System::sol());
+    });
+
+    for i in 0..10 {
+        dbg!(output_rx.recv().unwrap().0);
+    }
+
+    burn_tx
+        .send((nbody_simd::Vec3::new(0.0, 50_000.0, 0.0), 1))
+        .unwrap();
+
+    dbg!(());
+
+    for i in 0..10 {
+        dbg!(output_rx.recv().unwrap().0);
+    }
+
+    panic!();
 }
