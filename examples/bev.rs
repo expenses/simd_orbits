@@ -16,6 +16,9 @@ struct BodyRadius(f64);
 #[derive(Resource, Default)]
 struct FollowedBody(Option<usize>);
 
+#[derive(Resource, Default)]
+struct ReferenceFrameBody(Option<usize>);
+
 #[derive(Resource)]
 struct UniversalCamera {
     center: UniversalPos,
@@ -54,25 +57,6 @@ struct SystemStar;
 
 use std::simd::Simd;
 
-const PLANET_INFO: &[(&str, f64, &str)] = &[
-    ("Mercury", 2_439_700.0, "2k_mercury.jpg"),
-    ("Venus", 6_051_800.0, "2k_venus_atmosphere.jpg"),
-    ("Earth", 6_371_000.0, "2k_earth_daymap.jpg"),
-    ("Mars", 3_389_500.0, "2k_mars.jpg"),
-    ("Jupiter", 69_911_000.0, "2k_jupiter.jpg"),
-    ("Saturn", 69_911_000.0, "2k_saturn.jpg"),
-    ("Uranus", 69_911_000.0, "2k_uranus.jpg"),
-    ("Neptune", 69_911_000.0, "2k_neptune.jpg"),
-    ("Luna", 1_737_000.4, "2k_moon.jpg"),
-    ("Phobos", 11_080.0, "phobos.jpg"),
-    ("Deimos", 6_270.0, "deimos.jpg"),
-    ("Io", 1_821_600.0, "io.jpg"),
-    ("Europa", 1_560_800.0, "europa.png"),
-    ("Ganymede", 2_634_100.0, "ganymede_2k_downscaled.png"),
-    ("Callisto", 2_410_300.0, "callisto.jpg"),
-    ("Titan", 2_574_730.0, "2k_titan.png"),
-];
-
 // As values get converted to f32 for rendering, it's important to scale them down so they're not crazy high.
 // This helps prevent visual errors, mostly on the web/opengl.
 const SCALE: f64 = AU / 100_000.0;
@@ -94,8 +78,13 @@ fn main() {
                 state: system.state_at(0.0),
             }
         })
+        .insert_resource(PathSettings {
+            decimation: 10,
+            max_segments: 1_000_000,
+        })
         .init_resource::<SystemTime>()
         .init_resource::<FollowedBody>()
+        .init_resource::<ReferenceFrameBody>()
         .add_plugins(DefaultPlugins)
         .add_plugins(PolylinePlugin)
         .add_plugins(EguiPlugin)
@@ -107,7 +96,9 @@ fn main() {
                 set_star_positions.after(update_camera),
                 set_positions.after(get_state).after(update_camera),
                 set_path_positions.after(update_camera),
-                set_ship_path_positions.after(update_camera),
+                set_ship_path_positions
+                    .after(update_camera)
+                    .after(get_state),
                 handle_mouse_scroll.before(compute_camera_position),
                 handle_mouse_drags.before(compute_camera_position),
                 compute_camera_position.before(update_camera),
@@ -131,6 +122,12 @@ struct System {
 
 #[derive(Component)]
 struct ComputedPath([DVec3; 512]);
+
+#[derive(Resource)]
+struct PathSettings {
+    decimation: usize,
+    max_segments: usize,
+}
 
 impl ComputedPath {
     fn compute(body: OrbitParams<f64>) -> Self {
@@ -187,26 +184,98 @@ fn compute_camera_position(
 
 const AU: f64 = 1.495978707e11;
 
+#[derive(Clone, Copy)]
+struct ReferenceFrame {
+    body: usize,
+    base_pos: nbody_simd::Vec3<f64>,
+    system: nbody_simd::System,
+}
+
+impl ReferenceFrame {
+    #[inline]
+    fn get_offset(&self, time: f64) -> nbody_simd::Vec3<f64> {
+        //let current_pos = self.system.position_for_single_body(self.body, time);
+        Default::default() //self.base_pos - current_pos
+    }
+}
+
+#[inline]
+fn get_path_point_pos(
+    point: UniversalPos,
+    time: f64,
+    camera: &UniversalCamera,
+    reference_frame: Option<ReferenceFrame>,
+) -> Vec3 {
+    let mut pos = point - camera.position;
+
+    if let Some(reference_frame) = reference_frame {
+        pos += reference_frame.get_offset(time);
+    };
+
+    convert_vec(pos / SCALE).as_vec3()
+}
+
+#[inline]
+fn get_reference_frame_offset(
+    start_time: f64,
+    system: &System,
+    body: usize,
+    skip: usize,
+) -> impl Iterator<Item = nbody_simd::Vec3<f64>> {
+    let base = system.state.planet_and_moon_positions.get(body);
+
+    (0..).flat_map(move |run| {
+        (nbody_simd::Vec3::splat(base)
+            - system.system.position_for_single_body(
+                body,
+                Simd::from_array(std::array::from_fn(|i| {
+                    ((run * 64 + i) * skip) as f64 * 10.0 + start_time
+                })),
+            ))
+        .as_array()
+    })
+}
+
 fn set_ship_path_positions(
     camera: Res<UniversalCamera>,
     mut polylines: ResMut<Assets<Polyline>>,
     paths: Query<(&ShipPath, &PolylineHandle)>,
-    time: Res<SystemTime>,
+    settings: Res<PathSettings>,
+    system: Res<System>,
+    reference_frame: Res<ReferenceFrameBody>,
 ) {
     for (path, handle) in paths.iter() {
         let line = polylines.get_mut(&handle.0).unwrap();
         line.vertices.clear();
 
-        for point in path.positions.iter().step_by(10).chain(
-            path.positions
-                .get(path.positions.len() - 1..)
-                .iter()
-                .flat_map(|&inner| inner),
-        ) {
-            let pos = *point - camera.position;
+        let decimation: usize = settings.decimation;
+        let system_system: nbody_simd::System = system.system;
+
+        let reference_frame_at_time = reference_frame
+            .0
+            .into_iter()
+            .flat_map(|body| {
+                get_reference_frame_offset(path.start, &system, body, settings.decimation)
+            })
+            .chain(std::iter::repeat(Default::default()));
+
+        let mut time = path.start;
+
+        for (point, ref_offset) in path
+            .positions
+            .iter()
+            .step_by(settings.decimation)
+            .zip(reference_frame_at_time)
+            .take(settings.max_segments / settings.decimation)
+        {
+            let mut pos = *point - camera.position;
+            pos += ref_offset;
+
             line.vertices
                 // Move the lines closer to the camera for better stability on opengl.
                 .push(convert_vec(pos / SCALE).as_vec3());
+
+            time += 10.0 * settings.decimation as f64;
         }
     }
 }
@@ -278,6 +347,17 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
+    let planet_info = [
+        ("Mercury", "2k_mercury.jpg"),
+        ("Venus", "2k_venus_atmosphere.jpg"),
+        ("Earth", "2k_earth_daymap.jpg"),
+        ("Mars", "2k_mars.jpg"),
+        ("Jupiter", "2k_jupiter.jpg"),
+        ("Saturn", "2k_saturn.jpg"),
+        ("Uranus", "2k_uranus.jpg"),
+        ("Neptune", "2k_neptune.jpg"),
+    ];
+
     let sphere_mesh = asset_server.load("planet.glb#Mesh0/Primitive0");
     let saturn_rings = asset_server.load("saturn_rings.glb#Mesh0/Primitive0");
 
@@ -290,8 +370,8 @@ fn setup(
         let mut vel = nbody_simd::Vec3::new(0.0, 0.0, 100000.0);
         let mut points = vec![pos];
         let mut velocities = vec![vel];
-        let timestep = 100.0;
-        for i in 0..100_000 {
+        let timestep = 10.0;
+        for i in 0..1_000_000 {
             vel += system
                 .state_at(i as f64 * timestep)
                 .acceleration_at(pos.as_vec3())
@@ -334,7 +414,8 @@ fn setup(
     ));
 
     for i in 0..8 {
-        let (name, radius, image_filename) = PLANET_INFO[i];
+        let (name, image_filename) = planet_info[i];
+        let radius = nbody_simd::System::SOL_PLANETS[i].1;
 
         commands.spawn((
             ComputedPath::compute(system.planets.get(i)),
@@ -416,8 +497,20 @@ fn setup(
         }
     }
 
-    for i in 8..16 {
-        let (name, radius, image_filename) = PLANET_INFO[i];
+    let moon_info = [
+        ("Luna", "2k_moon.jpg"),
+        ("Phobos", "phobos.jpg"),
+        ("Deimos", "deimos.jpg"),
+        ("Io", "io.jpg"),
+        ("Europa", "europa.png"),
+        ("Ganymede", "ganymede_2k_downscaled.png"),
+        ("Callisto", "callisto.jpg"),
+        ("Titan", "2k_titan.png"),
+    ];
+
+    for i in 0..8 {
+        let (name, image_filename) = moon_info[i];
+        let radius = nbody_simd::System::SOL_MOONS[i].1;
 
         commands.spawn((
             Mesh3d(sphere_mesh.clone()),
@@ -428,7 +521,7 @@ fn setup(
                 ..Default::default()
             })),
             Transform::IDENTITY,
-            SystemBody(i),
+            SystemBody(i + 8),
             Name::new(name),
             BodyRadius(radius),
         ));
@@ -490,11 +583,19 @@ fn handle_mouse_scroll(
 fn update_ui(
     mut contexts: EguiContexts,
     mut followed: ResMut<FollowedBody>,
+    mut reference_frame: ResMut<ReferenceFrameBody>,
     mut time: ResMut<SystemTime>,
     mut burns: Query<(Entity, &mut Burn)>,
     mut commands: Commands,
+    mut path_settings: ResMut<PathSettings>,
+    system_bodies: Query<(&Name, &SystemBody)>,
 ) {
     egui::Window::new("Hello").show(contexts.ctx_mut(), |ui| {
+        ui.add(egui::Slider::new(&mut path_settings.decimation, 1..=10_000));
+        ui.add(egui::Slider::new(
+            &mut path_settings.max_segments,
+            1..=10_000_000,
+        ));
         ui.add(egui::Slider::new(&mut time.0, 0.0..=100_000_000.0));
 
         for (entity, mut burn) in burns.iter_mut() {
@@ -525,18 +626,19 @@ fn update_ui(
         if ui.button("None").clicked() {
             followed.0 = None;
         }
+        if ui.button("No Ref").clicked() {
+            reference_frame.0 = None;
+        }
 
-        for i in 0..16 {
-            if ui
-                .button(&if let Some((name, ..)) = PLANET_INFO.get(i) {
-                    name.to_string()
-                } else {
-                    format!("{}", i)
-                })
-                .clicked()
-            {
-                followed.0 = Some(i);
-            }
+        for (name, body) in system_bodies.iter() {
+            ui.horizontal(|ui| {
+                if ui.button(&**name).clicked() {
+                    followed.0 = Some(body.0);
+                }
+                if ui.button("Set ref").clicked() {
+                    reference_frame.0 = Some(body.0);
+                }
+            });
         }
     });
 }
@@ -555,10 +657,12 @@ fn get_closest_path_point(
     mut time: ResMut<SystemTime>,
     primary_window: Option<Single<&Window>>,
     buttons: Res<ButtonInput<MouseButton>>,
-    system: Res<System>,
     mut polyline_materials: ResMut<Assets<PolylineMaterial>>,
     mut polylines: ResMut<Assets<Polyline>>,
     mut commands: Commands,
+    settings: Res<PathSettings>,
+    reference_frame: Res<ReferenceFrameBody>,
+    system: Res<System>,
 ) {
     if contexts.ctx_mut().is_using_pointer() {
         return;
@@ -573,49 +677,53 @@ fn get_closest_path_point(
 
     let (render_cam, render_cam_transform) = *render_cam;
 
-    let world_to_ndc =
-        render_cam.clip_from_view() * render_cam_transform.compute_matrix().inverse();
-
-    let target_size = render_cam.logical_viewport_size().unwrap();
-
-    // flip the cursor position on the y axis to match
-    cursor_position.y = target_size.y - cursor_position.y;
+    let cone_dir =
+        if let Ok(ray) = render_cam.viewport_to_world(render_cam_transform, cursor_position) {
+            ray
+        } else {
+            return;
+        }
+        .direction
+        .as_vec3()
+        .as_dvec3();
 
     let compare_dist = 20.0;
+    let step = 10;
 
     let picked_position = paths
         .iter()
-        .flat_map(|(path)| {
+        .flat_map(|path| {
+            let reference_frame_at_time = reference_frame
+                .0
+                .into_iter()
+                .flat_map(|body| get_reference_frame_offset(path.start, &system, body, step))
+                .chain(std::iter::repeat(Default::default()));
+
             path.positions
                 .iter()
                 .enumerate()
+                .step_by(step)
                 .map(move |(i, pos)| (i, path, pos))
+                .zip(reference_frame_at_time)
+                .take(settings.max_segments)
         })
-        .filter_map(|(i, path, &pos)| {
-            let pos = pos - camera.position;
-            let world_pos = convert_vec(pos / SCALE).as_vec3();
-            let ndc_pos = world_to_ndc.project_point3(world_pos);
-            if ndc_pos.z < 0.0 || ndc_pos.z > 1.0 {
-                return None;
-            }
-            let screen_pos = (ndc_pos.truncate() + Vec2::ONE) / 2.0 * target_size;
-
-            let distance_sq = cursor_position.distance_squared(screen_pos);
-
-            if distance_sq > compare_dist * compare_dist {
-                return None;
-            }
-
-            Some((i, path, distance_sq))
+        .map(|((i, path, &pos), ref_offset)| {
+            let relative = convert_vec((pos - camera.position) + ref_offset);
+            let dir = relative.normalize();
+            let closeness = dir.dot(cone_dir);
+            (i, path, closeness)
         })
-        .min_by_key(|&(_, _, distance_sq)| ordered_float::OrderedFloat(distance_sq));
+        .max_by_key(|&(_, _, cosine_angle)| ordered_float::OrderedFloat(cosine_angle))
+        .filter(|&(_, _, cosine_angle)| cosine_angle > 0.9995);
 
-    if let Some((index, origin_path, _)) = picked_position {
+    if let Some((index, origin_path, x)) = picked_position {
         if buttons.just_pressed(MouseButton::Left) {
-            let start = index as f64 * 100.0 + origin_path.start;
-            time.0 = start;
-            let mut vel = origin_path.velocities[index];
-            let mut pos = origin_path.positions[index];
+            let start = index as f64 * 10.0 + origin_path.start;
+            if reference_frame.0.is_none() {
+                time.0 = start;
+            }
+            let vel = origin_path.velocities[index];
+            let pos = origin_path.positions[index];
             commands.spawn((
                 ShipPath {
                     start,
@@ -665,8 +773,8 @@ fn recalulate_burns(mut query: Query<(&mut Burn, &mut ShipPath)>, system: Res<Sy
         let mut vel = path.velocities[0] + burn.vector;
         path.positions.truncate(1);
         path.velocities.truncate(1);
-        let timestep = 100.0;
-        for i in 0..100_000 {
+        let timestep = 10.0;
+        for i in 0..1_000_000 {
             let state = system.system.state_at(i as f64 * timestep + path.start);
             if state.collides(pos.as_vec3()) {
                 break;
