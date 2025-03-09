@@ -11,7 +11,7 @@ use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, egui};
 use bevy_polyline::prelude::*;
-use nbody_simd::{OrbitParams, UniversalPos, sleef};
+use nbody_simd::{OrbitParams, UniversalPos, UniversalScalar, sleef};
 
 #[derive(Resource, Default)]
 struct SystemTime(f64);
@@ -24,21 +24,6 @@ struct FollowedBody(Option<usize>);
 
 #[derive(Resource, Default)]
 struct ReferenceFrameBody(Option<usize>);
-
-impl ReferenceFrameBody {
-    #[inline]
-    fn get_offsets(
-        &self,
-        start: f64,
-        system: &System,
-        step_by: usize,
-    ) -> impl Iterator<Item = nbody_simd::Vec3<f64>> {
-        self.0
-            .into_iter()
-            .flat_map(move |body| get_reference_frame_offset(start, system, body, step_by))
-            .chain(std::iter::repeat(Default::default()))
-    }
-}
 
 #[derive(Resource)]
 struct UniversalCamera {
@@ -133,6 +118,7 @@ fn main() {
                     .after(adjust_trajectory),
                 trajectory_handles.after(set_universal_positions),
                 adjust_trajectory,
+                adapt_paths_to_new_reference_frame.after(update_ui),
             ),
         )
         .run();
@@ -236,18 +222,15 @@ fn get_reference_frame_offset(
     start_time: f64,
     system: &System,
     body: usize,
-    skip: usize,
+    step: f64,
 ) -> impl Iterator<Item = nbody_simd::Vec3<f64>> {
-    let base = system.state.planet_and_moon_positions.get(body);
-
     (0..).flat_map(move |run| {
-        (nbody_simd::Vec3::splat(base)
-            - system.system.position_for_single_body(
-                body,
-                Simd::from_array(std::array::from_fn(|i| {
-                    ((run * 64 + i) * skip) as f64 * 10.0 + start_time
-                })),
-            ))
+        (-system.system.position_for_single_body(
+            body,
+            Simd::from_array(std::array::from_fn(|i| {
+                (run * 64 + i) as f64 * step + start_time
+            })),
+        ))
         .as_array()
     })
 }
@@ -339,7 +322,9 @@ fn setup(
     {
         let mut pos = UniversalPos::new_3(57_909_048_000.0 / 2.0, 0.0, 0.0);
         let mut vel = nbody_simd::Vec3::new(0.0, 0.0, 100000.0);
-        let mut points = vec![pos];
+        let start_pos = pos;
+        let start_vel = vel;
+        let mut positions = vec![pos];
         let mut velocities = vec![vel];
         let timestep = 10.0;
         for i in 0..1_000_000 {
@@ -348,14 +333,24 @@ fn setup(
                 .acceleration_at(pos.as_vec3())
                 * timestep;
             pos += vel * timestep;
-            points.push(pos);
+            positions.push(pos);
             velocities.push(vel);
         }
         commands.spawn((
             ShipPath {
                 start: 0.0,
-                velocities,
-                positions: points,
+                start_pos,
+                start_vel,
+                total_duration: positions.len() as f64 * timestep,
+                batches: vec![PathBatch {
+                    positions,
+                    velocities,
+                    adapted_positions: Default::default(),
+                    render_positions: Default::default(),
+                    min: Default::default(),
+                    max: Default::default(),
+                    step: timestep
+                }],
             },
             PolylineBundle {
                 polyline: PolylineHandle(polylines.add(Polyline::default())),
@@ -513,7 +508,13 @@ fn handle_mouse_drags(
     mut contexts: EguiContexts,
     cursor_on_ui_element: Res<CursorOnUiElement>,
 ) {
-    if contexts.ctx_mut().is_using_pointer() || cursor_on_ui_element.0.is_some() {
+    let ctx_mut = if let Some(ctx_mut) = contexts.try_ctx_mut() {
+        ctx_mut
+    } else {
+        return;
+    };
+
+    if ctx_mut.is_using_pointer() || cursor_on_ui_element.0.is_some() {
         return;
     }
 
@@ -558,11 +559,23 @@ struct ShipPathBefore;
 #[derive(Component)]
 struct ShipPathAfter;
 
+struct PathBatch {
+    positions: Vec<UniversalPos>,
+    adapted_positions: Vec<UniversalPos>,
+    render_positions: Vec<UniversalPos>,
+    velocities: Vec<nbody_simd::Vec3<f64>>,
+    min: UniversalPos,
+    max: UniversalPos,
+    step: f64,
+}
+
 #[derive(Component)]
 struct ShipPath {
     start: f64,
-    velocities: Vec<nbody_simd::Vec3<f64>>,
-    positions: Vec<UniversalPos>,
+    start_pos: UniversalPos,
+    start_vel: nbody_simd::Vec3<f64>,
+    batches: Vec<PathBatch>,
+    total_duration: f64,
 }
 
 #[derive(Component)]
@@ -573,17 +586,35 @@ struct Burn {
 fn receive_trajectories(
     mut query: Query<(&mut ShipPath, &TrajectoryReceiver)>,
     settings: Res<PathSettings>,
+    reference_frame: Res<ReferenceFrameBody>,
+    system: Res<System>,
 ) {
     for (mut path, recv) in query.iter_mut() {
         for batch in recv.inner.try_iter() {
             if batch.round != recv.expected_round {
-                path.positions.clear();
-                path.velocities.clear();
+                path.batches.clear();
+                path.total_duration = 0.0;
                 continue;
             }
 
-            path.positions.extend_from_slice(&batch.positions);
-            path.velocities.extend_from_slice(&batch.velocities);
+            let mut batch = PathBatch {
+                step: batch.step,
+                adapted_positions: Vec::with_capacity(batch.positions.len()),
+                positions: batch.positions,
+                velocities: batch.velocities,
+                render_positions: Vec::new(),
+                min: UniversalPos::splat(UniversalScalar::MAX),
+                max: UniversalPos::splat(UniversalScalar::MIN),
+            };
+
+            adapt_batch_to_reference_frame(
+                path.start + path.total_duration,
+                &mut batch,
+                &reference_frame,
+                &system,
+            );
+            path.total_duration += batch.positions.len() as f64 * batch.step;
+            path.batches.push(batch);
         }
     }
 }
@@ -604,8 +635,7 @@ struct TrajectoryBatch {
     positions: Vec<UniversalPos>,
     velocities: Vec<nbody_simd::Vec3<f64>>,
     collides: bool,
-    min: UniversalPos,
-    max: UniversalPos,
+    step: f64,
 }
 
 fn trajectory_calculator(
@@ -624,14 +654,16 @@ fn trajectory_calculator(
 
     loop {
         if wait_for_next {
-            let (burn, new_round) = commands.recv().unwrap();
+            let (burn, new_round) = if let Ok((burn, new_round)) = commands.recv() {
+                (burn, new_round)
+            } else {
+                return;
+            };
             pos = starting_pos;
             vel = starting_vel + burn;
             iteration = 0;
             round = new_round;
             wait_for_next = false;
-
-            dbg!(burn.length_squared().sqrt());
         }
 
         while let Ok((burn, new_round)) = commands.try_recv() {
@@ -639,24 +671,18 @@ fn trajectory_calculator(
             vel = starting_vel + burn;
             iteration = 0;
             round = new_round;
-            dbg!(burn.length_squared().sqrt());
         }
 
         let mut positions = Vec::with_capacity(10000);
         let mut velocities = Vec::with_capacity(10000);
 
-        let mut min = UniversalPos::splat(nbody_simd::UniversalScalar::MAX);
-        let mut max = UniversalPos::splat(nbody_simd::UniversalScalar::MIN);
-
         let timestep = 10.0;
         let mut collides = false;
         for i in 0..10000 {
-            min = min.min(pos);
-            max = max.max(pos);
             positions.push(pos);
             velocities.push(vel);
 
-            let state = system.state_at((iteration * 10000 + i) as f64 * timestep + start);
+            let state = system.state_at((iteration + i) as f64 * timestep + start);
             if state.collides(pos.as_vec3()) {
                 collides = true;
                 break;
@@ -664,17 +690,16 @@ fn trajectory_calculator(
             vel += state.acceleration_at(pos.as_vec3()) * timestep;
             pos += vel * timestep;
         }
-        iteration += 1;
+        iteration += 10000;
         output.send(TrajectoryBatch {
             round,
             positions,
             velocities,
             collides,
-            min,
-            max,
+            step: 10.0,
         });
 
-        wait_for_next = iteration >= 1_000_000 || collides;
+        wait_for_next = iteration >= 10_000_000 || collides;
     }
 }
 

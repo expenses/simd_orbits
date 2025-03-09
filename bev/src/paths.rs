@@ -34,6 +34,12 @@ pub fn set_ship_path_positions(
     system: Res<System>,
     reference_frame: Res<ReferenceFrameBody>,
 ) {
+    let offset = if let Some(body) = reference_frame.0 {
+        system.state.planet_and_moon_positions.get(body)
+    } else {
+        Default::default()
+    };
+
     for (path, handle) in paths.iter() {
         let line = polylines.get_mut(&handle.0).unwrap();
         line.vertices.clear();
@@ -41,17 +47,14 @@ pub fn set_ship_path_positions(
         let decimation: usize = settings.decimation;
         let system_system: nbody_simd::System = system.system;
 
-        let reference_frame_at_time =
-            reference_frame.get_offsets(path.start, &system, settings.decimation);
-
-        for (point, ref_offset) in path
-            .positions
+        for point in path
+            .batches
             .iter()
-            .step_by(settings.decimation)
-            .zip(reference_frame_at_time)
-            .take(settings.max_segments / settings.decimation)
+            .flat_map(|batch| &batch.render_positions)
+        //.step_by(settings.decimation)
+        //.take(settings.max_segments / settings.decimation)
         {
-            let pos = (*point - camera.position) + ref_offset;
+            let pos = (*point - camera.position) + offset;
 
             line.vertices
                 // Move the lines closer to the camera for better stability on opengl.
@@ -84,11 +87,6 @@ pub fn get_closest_path_point(
     sphere_mesh: Res<SphereMesh>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    if ui_params.contexts.ctx_mut().is_using_pointer() || ui_params.cursor_on_ui_element.0.is_some()
-    {
-        return;
-    }
-
     let mut cursor_position =
         if let Some(cursor_position) = primary_window.and_then(|window| window.cursor_position()) {
             cursor_position
@@ -96,49 +94,100 @@ pub fn get_closest_path_point(
             return;
         };
 
+    // Have this after the primary window check.
+    if ui_params.contexts.ctx_mut().is_using_pointer() || ui_params.cursor_on_ui_element.0.is_some()
+    {
+        return;
+    }
+
+    let offset = if let Some(body) = reference_frame.0 {
+        system.state.planet_and_moon_positions.get(body)
+    } else {
+        Default::default()
+    };
+
     let (render_cam, render_cam_transform) = *render_cam;
 
-    let cone_dir =
-        if let Ok(ray) = render_cam.viewport_to_world(render_cam_transform, cursor_position) {
-            ray
-        } else {
-            return;
-        }
-        .direction
-        .as_vec3()
-        .as_dvec3();
+    let ray = if let Ok(ray) = render_cam.viewport_to_world(render_cam_transform, cursor_position) {
+        ray
+    } else {
+        return;
+    };
+
+    let cone_dir = ray.direction.as_vec3().as_dvec3();
+
+    let reference_frame: &ReferenceFrameBody = &reference_frame;
+    let decimation = settings.selection_decimation;
+    let system: &System = &system;
+    let camera: &UniversalCamera = &camera;
 
     let picked_position = paths
         .iter()
         .flat_map(|path| {
-            let reference_frame_at_time =
-                reference_frame.get_offsets(path.start, &system, settings.selection_decimation);
-
-            path.positions
+            path.batches
                 .iter()
                 .enumerate()
-                .step_by(settings.selection_decimation)
-                .map(move |(i, pos)| (i, path, pos))
-                .zip(reference_frame_at_time)
+                .flat_map(move |(batch_id, batch)| {
+                    let min = convert_vec(batch.min - camera.position);
+                    let max = convert_vec(batch.max - camera.position);
+
+                    let center = (min + max) / 2.0;
+                    let radius = (max - min).length();
+
+                    /*let aabb = bevy::math::bounding::Aabb3d {
+                        min: (convert_vec(batch.min - camera.position) / camera.distance)
+                            .as_vec3()
+                            .into(),
+                        max: (convert_vec(batch.max - camera.position) / camera.distance)
+                            .as_vec3()
+                            .into(),
+                    };
+
+                    if bevy::math::bounding::RayCast3d::from_ray(ray, 1000.0)
+                        .aabb_intersection_at(&aabb)
+                        .is_none()
+                    {
+                        return None;
+                    }*/
+
+                    Some(
+                        batch
+                            .adapted_positions
+                            .iter()
+                            .enumerate()
+                            .map(move |(i, pos)| (batch_id, i, path, pos))
+                            .step_by(decimation),
+                    )
+                })
+                .flatten()
                 .take(settings.max_segments)
         })
-        .map(|((i, path, &pos), ref_offset)| {
-            let relative = convert_vec((pos - camera.position) + ref_offset);
+        .map(|((batch_id, i, path, &pos))| {
+            let relative = convert_vec((pos - camera.position) + offset);
             let dir = relative.normalize();
             let closeness = dir.dot(cone_dir);
-            (i, path, closeness)
+            (batch_id, i, path, closeness)
         })
-        .max_by_key(|&(_, _, cosine_angle)| ordered_float::OrderedFloat(cosine_angle))
-        .filter(|&(_, _, cosine_angle)| cosine_angle > 0.9995);
+        .max_by_key(|&(.., cosine_angle)| ordered_float::OrderedFloat(cosine_angle))
+        .filter(|&(.., cosine_angle)| cosine_angle > 0.9995);
 
-    if let Some((index, origin_path, x)) = picked_position {
+    if let Some((batch_id, index, origin_path, x)) = picked_position {
         if buttons.just_pressed(MouseButton::Left) {
-            let start = index as f64 * 10.0 + origin_path.start;
+            let start = origin_path.start
+                + origin_path
+                    .batches
+                    .iter()
+                    .take(batch_id)
+                    .map(|batch| batch.step * batch.positions.len() as f64)
+                    .sum::<f64>();
             if reference_frame.0.is_none() {
                 time.0 = start;
             }
-            let vel = origin_path.velocities[index];
-            let pos = origin_path.positions[index];
+
+            let batch = &origin_path.batches[batch_id];
+
+            let vel = batch.velocities[index];
+            let pos = batch.positions[index];
 
             let (output_tx, output_rx) = sync_channel(100);
             let (burn_tx, burn_rx) = sync_channel(10);
@@ -169,8 +218,10 @@ pub fn get_closest_path_point(
                     BurnTx(burn_tx),
                     ShipPath {
                         start,
-                        velocities: vec![vel],
-                        positions: vec![pos],
+                        start_pos: pos,
+                        start_vel: vel,
+                        batches: Vec::new(),
+                        total_duration: 0.0
                     },
                     Burn {
                         vector: Default::default(),
@@ -190,7 +241,7 @@ pub fn get_closest_path_point(
                 ))
                 .id();
 
-            let x_pos = commands.spawn((
+            /*let x_pos = commands.spawn((
                 AssociatedTrajectory(trajectory),
                 Mesh3d(sphere_mesh.0.clone()),
                 material.clone(),
@@ -199,7 +250,7 @@ pub fn get_closest_path_point(
                     pos,
                     offset: DVec3::new(5.0, 0.0, 0.0),
                 },
-            ));
+            ));*/
         }
     }
 }
@@ -246,7 +297,6 @@ pub fn trajectory_handles(
             .is_some()
         {
             cursor_on_ui_element.0 = Some(assoc.0);
-            dbg!(());
         }
     }
 }
@@ -285,6 +335,71 @@ pub fn adjust_trajectory(
     let new_round = trajec.expected_round + 1;
     trajec.expected_round = new_round;
     burn_tx.0.send((burn.vector, new_round)).unwrap();
-    path.positions.clear();
-    path.velocities.clear();
+    path.batches.clear();
+}
+
+pub fn adapt_batch_to_reference_frame(
+    time: f64,
+    batch: &mut PathBatch,
+    reference_frame: &ReferenceFrameBody,
+    system: &System,
+) {
+    if let Some(body) = reference_frame.0 {
+        let offsets = get_reference_frame_offset(time, system, body, batch.step);
+        batch.adapted_positions.clear();
+
+        batch.adapted_positions.extend(
+            batch
+                .positions
+                .iter()
+                .zip(offsets)
+                .map(|(pos, offset)| *pos + offset),
+        );
+    } else {
+        batch.adapted_positions.clone_from(&batch.positions);
+    }
+
+    for &position in &batch.adapted_positions {
+        batch.min = batch.min.min(position);
+        batch.max = batch.max.max(position);
+    }
+
+    decimate(&batch.adapted_positions, &mut batch.render_positions);
+}
+
+pub fn adapt_paths_to_new_reference_frame(
+    reference_frame: Res<ReferenceFrameBody>,
+    system: Res<System>,
+    mut query: Query<&mut ShipPath>,
+) {
+    if !reference_frame.is_changed() {
+        return;
+    }
+
+    for mut path in query.iter_mut() {
+        let mut time = path.start;
+
+        for batch in &mut path.batches {
+            adapt_batch_to_reference_frame(time, batch, &reference_frame, &system);
+            time += batch.positions.len() as f64 * batch.step;
+        }
+    }
+}
+fn decimate(points: &[UniversalPos], output: &mut Vec<UniversalPos>) {
+    output.clear();
+    output.push(points[0]);
+    let mut vector = convert_vec(points[1] - points[0]).normalize();
+    let mut last = points[1];
+
+    for &point in &points[2..] {
+        let new_vector = convert_vec(point - *output.last().unwrap()).normalize();
+        if new_vector.dot(vector) <= 0.5_f64.to_radians().cos() {
+            output.push(last);
+            vector = convert_vec(point - last).normalize();
+        }
+
+        last = point;
+    }
+
+    output.push(last);
 }

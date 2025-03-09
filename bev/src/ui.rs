@@ -52,8 +52,7 @@ pub fn update_ui(
                 let new_round = trajec.expected_round + 1;
                 trajec.expected_round = new_round;
                 burn_tx.0.send((burn.vector, new_round)).unwrap();
-                path.positions.clear();
-                path.velocities.clear();
+                path.batches.clear();
             }
         }
 

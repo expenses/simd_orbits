@@ -200,6 +200,19 @@ impl<T: simd::num::SimdFloat> Vec3<T> {
     }
 }
 
+impl<T: std::ops::Neg<Output = T>> std::ops::Neg for Vec3<T> {
+    type Output = Self;
+
+    #[inline]
+    fn neg(self) -> Self::Output {
+        Self {
+            x: -self.x,
+            y: -self.y,
+            z: -self.z,
+        }
+    }
+}
+
 impl<T: std::ops::Add<Output = T> + std::ops::Mul<Output = T> + Copy> Vec3<T> {
     #[inline]
     pub fn length_squared(&self) -> T {
@@ -921,9 +934,6 @@ fn universal_swizzle_8(a: UniversalSimd<8>, indices: [usize; 8]) -> UniversalSim
     UniversalSimd(std::array::from_fn(|i| a[indices[i]]))
 }
 
-#[test]
-fn testing() {}
-
 pub type UniversalScalar = fixed::types::I108F20;
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -938,6 +948,7 @@ use az::Cast;
 use std::ops::{AddAssign, Sub};
 
 impl From<Vec3<f64>> for UniversalPos {
+    #[inline]
     fn from(vec: Vec3<f64>) -> Self {
         Self::new_3(vec.x, vec.y, vec.z)
     }
