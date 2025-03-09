@@ -25,6 +25,21 @@ struct FollowedBody(Option<usize>);
 #[derive(Resource, Default)]
 struct ReferenceFrameBody(Option<usize>);
 
+impl ReferenceFrameBody {
+    #[inline]
+    fn get_offsets(
+        &self,
+        start: f64,
+        system: &System,
+        step_by: usize,
+    ) -> impl Iterator<Item = nbody_simd::Vec3<f64>> {
+        self.0
+            .into_iter()
+            .flat_map(move |body| get_reference_frame_offset(start, system, body, step_by))
+            .chain(std::iter::repeat(Default::default()))
+    }
+}
+
 #[derive(Resource)]
 struct UniversalCamera {
     center: UniversalPos,
@@ -64,13 +79,10 @@ struct SystemStar;
 
 use std::simd::Simd;
 
-// As values get converted to f32 for rendering, it's important to scale them down so they're not crazy high.
-// This helps prevent visual errors, mostly on the web/opengl.
-const SCALE: f64 = AU / 100_000.0;
-
 fn main() {
     App::new()
         .insert_resource(ClearColor(Color::BLACK))
+        .insert_resource(ColorChooser { hue: 16.666666 })
         .insert_resource(UniversalCamera {
             center: Default::default(),
             distance: AU,
@@ -87,8 +99,10 @@ fn main() {
         })
         .insert_resource(PathSettings {
             decimation: 10,
+            selection_decimation: 10,
             max_segments: 1_000_000,
         })
+        .init_resource::<CursorOnUiElement>()
         .init_resource::<SystemTime>()
         .init_resource::<FollowedBody>()
         .init_resource::<ReferenceFrameBody>()
@@ -101,21 +115,40 @@ fn main() {
             (
                 get_state,
                 set_star_positions.after(update_camera),
+                set_universal_positions.after(update_camera),
                 set_positions.after(get_state).after(update_camera),
                 set_path_positions.after(update_camera),
                 set_ship_path_positions
                     .after(update_camera)
-                    .after(get_state),
+                    .after(get_state)
+                    .after(receive_trajectories),
                 handle_mouse_scroll.before(compute_camera_position),
                 handle_mouse_drags.before(compute_camera_position),
                 compute_camera_position.before(update_camera),
                 update_camera,
                 get_closest_path_point.after(update_camera),
                 update_ui,
-                receive_trajectories.after(update_ui),
+                receive_trajectories
+                    .after(update_ui)
+                    .after(adjust_trajectory),
+                trajectory_handles.after(set_universal_positions),
+                adjust_trajectory,
             ),
         )
         .run();
+}
+
+#[derive(Resource)]
+struct ColorChooser {
+    hue: f32,
+}
+
+impl ColorChooser {
+    fn next(&mut self) -> LinearRgba {
+        let col = Color::hsl(self.hue, 0.75, 0.5).to_linear();
+        self.hue += (360.0 / 4.4);
+        col
+    }
 }
 
 #[derive(Component)]
@@ -130,9 +163,16 @@ struct System {
 #[derive(Component)]
 struct ComputedPath([DVec3; 512]);
 
+#[derive(Component)]
+struct UniversalObjectPos {
+    pos: UniversalPos,
+    offset: DVec3,
+}
+
 #[derive(Resource)]
 struct PathSettings {
     decimation: usize,
+    selection_decimation: usize,
     max_segments: usize,
 }
 
@@ -191,37 +231,6 @@ fn compute_camera_position(
 
 const AU: f64 = 1.495978707e11;
 
-#[derive(Clone, Copy)]
-struct ReferenceFrame {
-    body: usize,
-    base_pos: nbody_simd::Vec3<f64>,
-    system: nbody_simd::System,
-}
-
-impl ReferenceFrame {
-    #[inline]
-    fn get_offset(&self, time: f64) -> nbody_simd::Vec3<f64> {
-        //let current_pos = self.system.position_for_single_body(self.body, time);
-        Default::default() //self.base_pos - current_pos
-    }
-}
-
-#[inline]
-fn get_path_point_pos(
-    point: UniversalPos,
-    time: f64,
-    camera: &UniversalCamera,
-    reference_frame: Option<ReferenceFrame>,
-) -> Vec3 {
-    let mut pos = point - camera.position;
-
-    if let Some(reference_frame) = reference_frame {
-        pos += reference_frame.get_offset(time);
-    };
-
-    convert_vec(pos / SCALE).as_vec3()
-}
-
 #[inline]
 fn get_reference_frame_offset(
     start_time: f64,
@@ -243,6 +252,21 @@ fn get_reference_frame_offset(
     })
 }
 
+fn set_universal_positions(
+    mut query: Query<(&UniversalObjectPos, &mut Transform)>,
+    camera: Res<UniversalCamera>,
+) {
+    for (univ_pos, mut transform) in query.iter_mut() {
+        let pos = univ_pos.pos - camera.position;
+        let pos = convert_vec(pos / camera.distance);
+        let distance = pos.length();
+        let pos = (pos + univ_pos.offset / 200.0).as_vec3();
+        *transform = transform
+            .with_translation(pos)
+            .with_scale(Vec3::splat((distance / 200.0) as f32));
+    }
+}
+
 fn set_positions(
     system: Res<System>,
     mut query: Query<(&SystemBody, &mut Transform, &BodyRadius)>,
@@ -253,29 +277,34 @@ fn set_positions(
     let get_pos = |i| {
         let pos = positions.get(i);
         let pos = pos - camera.position.as_vec3();
-        let pos = convert_vec(pos / SCALE);
+        let pos = convert_vec(pos / camera.distance);
         let length = pos.length();
         (pos.as_vec3(), length)
     };
 
     for (body, mut transform, radius) in query.iter_mut() {
         let (pos, distance) = get_pos(body.0);
-        *transform = transform
-            .with_translation(pos)
-            .with_scale(Vec3::splat((radius.0 / SCALE).max(distance / 200.0) as f32));
+        *transform = transform.with_translation(pos).with_scale(Vec3::splat(
+            (radius.0 / camera.distance).max(distance / 200.0) as f32,
+        ));
     }
 }
+
+#[derive(Resource)]
+struct SphereMesh(Handle<Mesh>);
 
 fn set_star_positions(
     mut query: Query<(&mut Transform, &BodyRadius), With<SystemStar>>,
     camera: Res<UniversalCamera>,
 ) {
     for (mut transform, radius) in query.iter_mut() {
-        let pos = -convert_vec(camera.position.as_vec3()) / SCALE;
+        let pos = -convert_vec(camera.position.as_vec3()) / camera.distance;
         let distance = pos.length();
         *transform = transform
             .with_translation(pos.as_vec3())
-            .with_scale(Vec3::splat((radius.0 / SCALE).max(distance / 75.0) as f32));
+            .with_scale(Vec3::splat(
+                (radius.0 / camera.distance).max(distance / 75.0) as f32,
+            ));
     }
 }
 
@@ -285,6 +314,7 @@ fn setup(
     mut polylines: ResMut<Assets<Polyline>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
+    mut color_chooser: ResMut<ColorChooser>,
 ) {
     let planet_info = [
         ("Mercury", "2k_mercury.jpg"),
@@ -299,6 +329,8 @@ fn setup(
 
     let sphere_mesh = asset_server.load("planet.glb#Mesh0/Primitive0");
     let saturn_rings = asset_server.load("saturn_rings.glb#Mesh0/Primitive0");
+
+    commands.insert_resource(SphereMesh(sphere_mesh.clone()));
 
     let system = nbody_simd::System::sol();
 
@@ -329,7 +361,7 @@ fn setup(
                 polyline: PolylineHandle(polylines.add(Polyline::default())),
                 material: PolylineMaterialHandle(polyline_materials.add(PolylineMaterial {
                     width: 1.0,
-                    color: Color::hsl(90.0, 1.0, 0.5).to_linear(),
+                    color: color_chooser.next(),
                     perspective: false,
                     ..Default::default()
                 })),
@@ -479,8 +511,9 @@ fn handle_mouse_drags(
     mut camera: ResMut<UniversalCamera>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut contexts: EguiContexts,
+    cursor_on_ui_element: Res<CursorOnUiElement>,
 ) {
-    if contexts.ctx_mut().is_using_pointer() {
+    if contexts.ctx_mut().is_using_pointer() || cursor_on_ui_element.0.is_some() {
         return;
     }
 
@@ -542,15 +575,15 @@ fn receive_trajectories(
     settings: Res<PathSettings>,
 ) {
     for (mut path, recv) in query.iter_mut() {
-        for (round, positions, velocities, collides) in recv.inner.try_iter() {
-            if round != recv.expected_round {
+        for batch in recv.inner.try_iter() {
+            if batch.round != recv.expected_round {
                 path.positions.clear();
                 path.velocities.clear();
                 continue;
             }
 
-            path.positions.extend_from_slice(&positions);
-            path.velocities.extend_from_slice(&velocities);
+            path.positions.extend_from_slice(&batch.positions);
+            path.velocities.extend_from_slice(&batch.velocities);
         }
     }
 }
@@ -558,7 +591,7 @@ fn receive_trajectories(
 #[derive(Component)]
 struct TrajectoryReceiver {
     expected_round: usize,
-    inner: Receiver<(usize, Vec<UniversalPos>, Vec<nbody_simd::Vec3<f64>>, bool)>,
+    inner: Receiver<TrajectoryBatch>,
 }
 
 #[derive(Component)]
@@ -566,8 +599,17 @@ struct BurnTx(Sender<(nbody_simd::Vec3<f64>, usize)>);
 
 use std::sync::mpmc::{Receiver, Sender, sync_channel};
 
+struct TrajectoryBatch {
+    round: usize,
+    positions: Vec<UniversalPos>,
+    velocities: Vec<nbody_simd::Vec3<f64>>,
+    collides: bool,
+    min: UniversalPos,
+    max: UniversalPos,
+}
+
 fn trajectory_calculator(
-    output: Sender<(usize, Vec<UniversalPos>, Vec<nbody_simd::Vec3<f64>>, bool)>,
+    output: Sender<TrajectoryBatch>,
     commands: Receiver<(nbody_simd::Vec3<f64>, usize)>,
     start: f64,
     starting_pos: UniversalPos,
@@ -578,7 +620,7 @@ fn trajectory_calculator(
     let mut vel = starting_vel;
     let mut iteration = 0;
     let mut round = 0;
-    let mut wait_for_next = false;
+    let mut wait_for_next = true;
 
     loop {
         if wait_for_next {
@@ -588,6 +630,8 @@ fn trajectory_calculator(
             iteration = 0;
             round = new_round;
             wait_for_next = false;
+
+            dbg!(burn.length_squared().sqrt());
         }
 
         while let Ok((burn, new_round)) = commands.try_recv() {
@@ -595,35 +639,47 @@ fn trajectory_calculator(
             vel = starting_vel + burn;
             iteration = 0;
             round = new_round;
+            dbg!(burn.length_squared().sqrt());
         }
 
-        //dbg!(());
+        let mut positions = Vec::with_capacity(10000);
+        let mut velocities = Vec::with_capacity(10000);
 
-        let mut positions = vec![Default::default(); 10240];
-        let mut velocities = vec![Default::default(); 10240];
+        let mut min = UniversalPos::splat(nbody_simd::UniversalScalar::MAX);
+        let mut max = UniversalPos::splat(nbody_simd::UniversalScalar::MIN);
 
         let timestep = 10.0;
         let mut collides = false;
-        for i in 0..10240 {
-            positions[i] = pos;
-            velocities[i] = vel;
+        for i in 0..10000 {
+            min = min.min(pos);
+            max = max.max(pos);
+            positions.push(pos);
+            velocities.push(vel);
 
-            let state = system.state_at((iteration + i) as f64 * timestep + start);
+            let state = system.state_at((iteration * 10000 + i) as f64 * timestep + start);
             if state.collides(pos.as_vec3()) {
                 collides = true;
-                positions.truncate(i + 1);
-                velocities.truncate(i + 1);
                 break;
             }
             vel += state.acceleration_at(pos.as_vec3()) * timestep;
             pos += vel * timestep;
         }
-        iteration += 10240;
-        output.send((round, positions, velocities, collides));
+        iteration += 1;
+        output.send(TrajectoryBatch {
+            round,
+            positions,
+            velocities,
+            collides,
+            min,
+            max,
+        });
 
-        wait_for_next = iteration > 1024 * 1024 || collides;
+        wait_for_next = iteration >= 1_000_000 || collides;
     }
 }
+
+#[derive(Resource, Default)]
+struct CursorOnUiElement(Option<Entity>);
 
 #[test]
 fn test_trajectory_thread() {

@@ -18,3 +18,7 @@ harness = false
 
 [workspace]
 members = [".", "bev"]
+
+
+[profile.release]
+debug = 1

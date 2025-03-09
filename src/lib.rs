@@ -924,7 +924,7 @@ fn universal_swizzle_8(a: UniversalSimd<8>, indices: [usize; 8]) -> UniversalSim
 #[test]
 fn testing() {}
 
-type UniversalScalar = fixed::types::I108F20;
+pub type UniversalScalar = fixed::types::I108F20;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct UniversalPos {
@@ -944,6 +944,29 @@ impl From<Vec3<f64>> for UniversalPos {
 }
 
 impl UniversalPos {
+    #[inline]
+    pub fn splat(v: UniversalScalar) -> Self {
+        Self::new(v, v, v)
+    }
+
+    #[inline]
+    pub fn min(self, other: Self) -> Self {
+        Self::new(
+            self.x.min(other.x),
+            self.y.min(other.y),
+            self.z.min(other.z),
+        )
+    }
+
+    #[inline]
+    pub fn max(self, other: Self) -> Self {
+        Self::new(
+            self.x.max(other.x),
+            self.y.max(other.y),
+            self.z.max(other.z),
+        )
+    }
+
     #[inline]
     pub fn new_3(x: f64, y: f64, z: f64) -> Self {
         Self::new(
