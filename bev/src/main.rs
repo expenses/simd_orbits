@@ -1,9 +1,17 @@
 #![feature(portable_simd, mpmc_channel)]
 
+use std::simd::num::SimdFloat;
+
+mod controls;
 mod paths;
+mod rendering_prep;
+mod setup;
 mod ui;
 
+use controls::*;
 use paths::*;
+use rendering_prep::*;
+use setup::*;
 use ui::update_ui;
 
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
@@ -50,7 +58,7 @@ impl UniversalCamera {
 
     fn rotate_yaw_pitch(&mut self, yaw: f32, pitch: f32) {
         self.pitch =
-            (self.pitch + (pitch as f64) / 100.0).clamp(std::f64::EPSILON, std::f64::consts::PI);
+            (self.pitch + (pitch as f64) / 100.0).clamp(f64::EPSILON, std::f64::consts::PI);
         self.yaw += (yaw as f64) / 100.0;
     }
 }
@@ -83,8 +91,6 @@ fn main() {
             }
         })
         .insert_resource(PathSettings {
-            decimation: 10,
-            selection_decimation: 10,
             max_segments: 1_000_000,
         })
         .init_resource::<CursorOnUiElement>()
@@ -101,8 +107,8 @@ fn main() {
                 get_state,
                 set_star_positions.after(update_camera),
                 set_universal_positions.after(update_camera),
-                set_positions.after(get_state).after(update_camera),
-                set_path_positions.after(update_camera),
+                set_body_positions.after(get_state).after(update_camera),
+                set_body_path_positions.after(update_camera),
                 set_ship_path_positions
                     .after(update_camera)
                     .after(get_state)
@@ -132,7 +138,7 @@ struct ColorChooser {
 impl ColorChooser {
     fn next(&mut self) -> LinearRgba {
         let col = Color::hsl(self.hue, 0.75, 0.5).to_linear();
-        self.hue += (360.0 / 4.4);
+        self.hue += 360.0 / 4.4;
         col
     }
 }
@@ -157,8 +163,6 @@ struct UniversalObjectPos {
 
 #[derive(Resource)]
 struct PathSettings {
-    decimation: usize,
-    selection_decimation: usize,
     max_segments: usize,
 }
 
@@ -250,314 +254,8 @@ fn set_universal_positions(
     }
 }
 
-fn set_positions(
-    system: Res<System>,
-    mut query: Query<(&SystemBody, &mut Transform, &BodyRadius)>,
-    camera: Res<UniversalCamera>,
-) {
-    let positions = system.state.planet_and_moon_positions;
-
-    let get_pos = |i| {
-        let pos = positions.get(i);
-        let pos = pos - camera.position.as_vec3();
-        let pos = convert_vec(pos / camera.distance);
-        let length = pos.length();
-        (pos.as_vec3(), length)
-    };
-
-    for (body, mut transform, radius) in query.iter_mut() {
-        let (pos, distance) = get_pos(body.0);
-        *transform = transform.with_translation(pos).with_scale(Vec3::splat(
-            (radius.0 / camera.distance).max(distance / 200.0) as f32,
-        ));
-    }
-}
-
 #[derive(Resource)]
 struct SphereMesh(Handle<Mesh>);
-
-fn set_star_positions(
-    mut query: Query<(&mut Transform, &BodyRadius), With<SystemStar>>,
-    camera: Res<UniversalCamera>,
-) {
-    for (mut transform, radius) in query.iter_mut() {
-        let pos = -convert_vec(camera.position.as_vec3()) / camera.distance;
-        let distance = pos.length();
-        *transform = transform
-            .with_translation(pos.as_vec3())
-            .with_scale(Vec3::splat(
-                (radius.0 / camera.distance).max(distance / 75.0) as f32,
-            ));
-    }
-}
-
-fn setup(
-    mut commands: Commands,
-    mut polyline_materials: ResMut<Assets<PolylineMaterial>>,
-    mut polylines: ResMut<Assets<Polyline>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
-    mut color_chooser: ResMut<ColorChooser>,
-) {
-    let planet_info = [
-        ("Mercury", "2k_mercury.jpg"),
-        ("Venus", "2k_venus_atmosphere.jpg"),
-        ("Earth", "2k_earth_daymap.jpg"),
-        ("Mars", "2k_mars.jpg"),
-        ("Jupiter", "2k_jupiter.jpg"),
-        ("Saturn", "2k_saturn.jpg"),
-        ("Uranus", "2k_uranus.jpg"),
-        ("Neptune", "2k_neptune.jpg"),
-    ];
-
-    let sphere_mesh = asset_server.load("planet.glb#Mesh0/Primitive0");
-    let saturn_rings = asset_server.load("saturn_rings.glb#Mesh0/Primitive0");
-
-    commands.insert_resource(SphereMesh(sphere_mesh.clone()));
-
-    let system = nbody_simd::System::sol();
-
-    let colour = Color::hsl(55.0, 0.75, 1.5).to_linear();
-
-    {
-        let mut pos = UniversalPos::new_3(57_909_048_000.0 / 2.0, 0.0, 0.0);
-        let mut vel = nbody_simd::Vec3::new(0.0, 0.0, 100000.0);
-        let start_pos = pos;
-        let start_vel = vel;
-        let mut positions = vec![pos];
-        let mut velocities = vec![vel];
-        let timestep = 10.0;
-        for i in 0..1_000_000 {
-            vel += system
-                .state_at(i as f64 * timestep)
-                .acceleration_at(pos.as_vec3())
-                * timestep;
-            pos += vel * timestep;
-            positions.push(pos);
-            velocities.push(vel);
-        }
-        commands.spawn((
-            ShipPath {
-                start: 0.0,
-                start_pos,
-                start_vel,
-                total_duration: positions.len() as f64 * timestep,
-                batches: vec![PathBatch {
-                    positions,
-                    velocities,
-                    adapted_positions: Default::default(),
-                    render_positions: Default::default(),
-                    min: Default::default(),
-                    max: Default::default(),
-                    step: timestep
-                }],
-            },
-            PolylineBundle {
-                polyline: PolylineHandle(polylines.add(Polyline::default())),
-                material: PolylineMaterialHandle(polyline_materials.add(PolylineMaterial {
-                    width: 1.0,
-                    color: color_chooser.next(),
-                    perspective: false,
-                    ..Default::default()
-                })),
-                ..Default::default()
-            },
-        ));
-    }
-
-    commands.spawn((
-        Mesh3d(sphere_mesh.clone()),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            perceptual_roughness: 1.0,
-            base_color_texture: Some(asset_server.load("2k_sun.jpg")),
-            unlit: true,
-            ..Default::default()
-        })),
-        Transform::IDENTITY,
-        Name::new("Sol"),
-        BodyRadius(nbody_simd::System::SOL_RADIUS),
-        SystemStar,
-    ));
-
-    for i in 0..8 {
-        let (name, image_filename) = planet_info[i];
-        let radius = nbody_simd::System::SOL_PLANETS[i].1;
-
-        commands.spawn((
-            ComputedPath::compute(system.planets.get(i)),
-            PolylineBundle {
-                polyline: PolylineHandle(polylines.add(Polyline::default())),
-                material: PolylineMaterialHandle(polyline_materials.add(PolylineMaterial {
-                    width: 1.0,
-                    color: colour,
-                    perspective: false,
-                    ..Default::default()
-                })),
-                ..Default::default()
-            },
-        ));
-
-        let mut entity_commands = commands.spawn((
-            Mesh3d(sphere_mesh.clone()),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                perceptual_roughness: 1.0,
-                base_color_texture: Some(asset_server.load(image_filename)),
-                unlit: true,
-                ..Default::default()
-            })),
-            Transform::IDENTITY,
-            SystemBody(i),
-            Name::new(name),
-            BodyRadius(radius),
-        ));
-
-        if i == 2 {
-            entity_commands.with_child((
-                Mesh3d(sphere_mesh.clone()),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    perceptual_roughness: 1.0,
-                    base_color_texture: Some(asset_server.load("clouds_alpha.png")),
-                    unlit: true,
-                    double_sided: true,
-                    alpha_mode: bevy::render::alpha::AlphaMode::Blend,
-                    ..Default::default()
-                })),
-                Transform::from_scale(Vec3::splat(1.015)),
-            ));
-        }
-
-        if i == 5 {
-            entity_commands.with_child((
-                Mesh3d(saturn_rings.clone()),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    perceptual_roughness: 1.0,
-                    base_color_texture: Some(asset_server.load("2k_saturn_ring_alpha.png")),
-                    unlit: true,
-                    double_sided: true,
-                    alpha_mode: bevy::render::alpha::AlphaMode::Blend,
-                    cull_mode: None,
-                    ..Default::default()
-                })),
-            ));
-        }
-
-        for j in 0..8 {
-            if system.moon_parent_swizzles[j] != i {
-                continue;
-            }
-
-            commands.spawn((
-                ComputedPath::compute(system.moons.get(j)),
-                ParentBody(i),
-                PolylineBundle {
-                    polyline: PolylineHandle(polylines.add(Polyline::default())),
-                    material: PolylineMaterialHandle(polyline_materials.add(PolylineMaterial {
-                        width: 1.0,
-                        color: colour,
-                        perspective: false,
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-            ));
-        }
-    }
-
-    let moon_info = [
-        ("Luna", "2k_moon.jpg"),
-        ("Phobos", "phobos.jpg"),
-        ("Deimos", "deimos.jpg"),
-        ("Io", "io.jpg"),
-        ("Europa", "europa.png"),
-        ("Ganymede", "ganymede_2k_downscaled.png"),
-        ("Callisto", "callisto.jpg"),
-        ("Titan", "2k_titan.png"),
-    ];
-
-    for i in 0..8 {
-        let (name, image_filename) = moon_info[i];
-        let radius = nbody_simd::System::SOL_MOONS[i].1;
-
-        commands.spawn((
-            Mesh3d(sphere_mesh.clone()),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                perceptual_roughness: 1.0,
-                base_color_texture: Some(asset_server.load(image_filename)),
-                unlit: true,
-                ..Default::default()
-            })),
-            Transform::IDENTITY,
-            SystemBody(i + 8),
-            Name::new(name),
-            BodyRadius(radius),
-        ));
-    }
-
-    commands.spawn((Camera3d::default(),));
-}
-
-fn update_camera(mut trans: Query<&mut Transform, With<Camera3d>>, camera: Res<UniversalCamera>) {
-    let mut t = trans.single_mut();
-    *t = Transform::from_translation(Vec3::ZERO).looking_at(-camera.view_dir().as_vec3(), Vec3::Y);
-}
-
-fn handle_mouse_drags(
-    mut mouse_motion_events: EventReader<MouseMotion>,
-    mut camera: ResMut<UniversalCamera>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    mut contexts: EguiContexts,
-    cursor_on_ui_element: Res<CursorOnUiElement>,
-) {
-    let ctx_mut = if let Some(ctx_mut) = contexts.try_ctx_mut() {
-        ctx_mut
-    } else {
-        return;
-    };
-
-    if ctx_mut.is_using_pointer() || cursor_on_ui_element.0.is_some() {
-        return;
-    }
-
-    let sensitivity = Vec2::splat(2.0);
-
-    let mut delta = Vec2::ZERO;
-    for event in mouse_motion_events.read() {
-        delta += event.delta;
-    }
-
-    if buttons.pressed(MouseButton::Left) {
-        camera.rotate_yaw_pitch(
-            -0.1 * delta.x * sensitivity.x,
-            -0.1 * delta.y * sensitivity.y,
-        );
-    }
-
-    if buttons.pressed(MouseButton::Right) {
-        camera.rotate_yaw_pitch(
-            -0.1 * delta.x * sensitivity.x,
-            -0.1 * delta.y * sensitivity.y,
-        );
-    }
-}
-
-fn handle_mouse_scroll(
-    mut mouse_wheel_events: EventReader<MouseWheel>,
-    mut camera: ResMut<UniversalCamera>,
-) {
-    for mouse_wheel_event in mouse_wheel_events.read() {
-        let factor = match mouse_wheel_event.unit {
-            MouseScrollUnit::Line => 1.0,
-            MouseScrollUnit::Pixel => 0.005,
-        };
-        camera.distance *= 1.0 + mouse_wheel_event.y as f64 * -0.1 * factor;
-    }
-}
-
-#[derive(Component)]
-struct ShipPathBefore;
-
-#[derive(Component)]
-struct ShipPathAfter;
 
 struct PathBatch {
     positions: Vec<UniversalPos>,
@@ -569,6 +267,12 @@ struct PathBatch {
     step: f64,
 }
 
+impl PathBatch {
+    fn duration(&self) -> f64 {
+        self.positions.len() as f64 * self.step
+    }
+}
+
 #[derive(Component)]
 struct ShipPath {
     start: f64,
@@ -578,6 +282,13 @@ struct ShipPath {
     total_duration: f64,
 }
 
+impl ShipPath {
+    fn clear(&mut self) {
+        self.batches.clear();
+        self.total_duration = 0.0;
+    }
+}
+
 #[derive(Component)]
 struct Burn {
     vector: nbody_simd::Vec3<f64>,
@@ -585,15 +296,13 @@ struct Burn {
 
 fn receive_trajectories(
     mut query: Query<(&mut ShipPath, &TrajectoryReceiver)>,
-    settings: Res<PathSettings>,
     reference_frame: Res<ReferenceFrameBody>,
     system: Res<System>,
 ) {
     for (mut path, recv) in query.iter_mut() {
         for batch in recv.inner.try_iter() {
             if batch.round != recv.expected_round {
-                path.batches.clear();
-                path.total_duration = 0.0;
+                path.clear();
                 continue;
             }
 
@@ -613,7 +322,7 @@ fn receive_trajectories(
                 &reference_frame,
                 &system,
             );
-            path.total_duration += batch.positions.len() as f64 * batch.step;
+            path.total_duration += batch.duration();
             path.batches.push(batch);
         }
     }
@@ -623,10 +332,8 @@ fn receive_trajectories(
 struct TrajectoryReceiver {
     expected_round: usize,
     inner: Receiver<TrajectoryBatch>,
+    burn_tx: Sender<(nbody_simd::Vec3<f64>, usize)>,
 }
-
-#[derive(Component)]
-struct BurnTx(Sender<(nbody_simd::Vec3<f64>, usize)>);
 
 use std::sync::mpmc::{Receiver, Sender, sync_channel};
 
@@ -646,10 +353,24 @@ fn trajectory_calculator(
     starting_vel: nbody_simd::Vec3<f64>,
     system: nbody_simd::System,
 ) {
-    let mut pos = starting_pos;
-    let mut vel = starting_vel;
-    let mut iteration = 0;
-    let mut round = 0;
+    let batch_size = 10_000;
+
+    struct CalculatorState {
+        pos: UniversalPos,
+        vel: nbody_simd::Vec3<f64>,
+        iteration: usize,
+        round: usize,
+        time: f64,
+    }
+
+    let mut calc_state = CalculatorState {
+        pos: starting_pos,
+        vel: starting_vel,
+        iteration: 0,
+        round: 0,
+        time: start,
+    };
+
     let mut wait_for_next = true;
 
     loop {
@@ -659,47 +380,63 @@ fn trajectory_calculator(
             } else {
                 return;
             };
-            pos = starting_pos;
-            vel = starting_vel + burn;
-            iteration = 0;
-            round = new_round;
-            wait_for_next = false;
+            calc_state = CalculatorState {
+                pos: starting_pos,
+                vel: starting_vel + burn,
+                iteration: 0,
+                round: new_round,
+                time: start,
+            };
         }
 
         while let Ok((burn, new_round)) = commands.try_recv() {
-            pos = starting_pos;
-            vel = starting_vel + burn;
-            iteration = 0;
-            round = new_round;
+            calc_state = CalculatorState {
+                pos: starting_pos,
+                vel: starting_vel + burn,
+                iteration: 0,
+                round: new_round,
+                time: start,
+            };
         }
 
-        let mut positions = Vec::with_capacity(10000);
-        let mut velocities = Vec::with_capacity(10000);
+        let mut positions = Vec::with_capacity(batch_size);
+        let mut velocities = Vec::with_capacity(batch_size);
 
-        let timestep = 10.0;
+        let mut state = system.state_at(calc_state.time);
+        let nearest = ((state.planet_and_moon_positions
+            - nbody_simd::Vec3::splat(calc_state.pos.as_vec3()))
+        .length_squared())
+        .reduce_min()
+        .sqrt();
+
+        let seconds_to_nearest_body = nearest / convert_vec(calc_state.vel).length();
+
+        // Large timesteps are allowed but we should only reach 90% of the way to the nearest body with them.
+        let timestep = ((seconds_to_nearest_body / batch_size as f64) * 0.9).max(1.0);
         let mut collides = false;
-        for i in 0..10000 {
-            positions.push(pos);
-            velocities.push(vel);
+        for i in 0..batch_size {
+            positions.push(calc_state.pos);
+            velocities.push(calc_state.vel);
 
-            let state = system.state_at((iteration + i) as f64 * timestep + start);
-            if state.collides(pos.as_vec3()) {
+            if state.collides(calc_state.pos.as_vec3()) {
                 collides = true;
                 break;
             }
-            vel += state.acceleration_at(pos.as_vec3()) * timestep;
-            pos += vel * timestep;
+            calc_state.vel += state.acceleration_at(calc_state.pos.as_vec3()) * timestep;
+            calc_state.pos += calc_state.vel * timestep;
+            state = system.state_at(calc_state.time + timestep * (i + 1) as f64);
         }
-        iteration += 10000;
-        output.send(TrajectoryBatch {
-            round,
+        calc_state.iteration += batch_size;
+        calc_state.time += batch_size as f64 * timestep;
+        let _ = output.send(TrajectoryBatch {
+            round: calc_state.round,
             positions,
             velocities,
             collides,
-            step: 10.0,
+            step: timestep,
         });
 
-        wait_for_next = iteration >= 10_000_000 || collides;
+        wait_for_next = calc_state.iteration >= 1_000_000 || collides;
     }
 }
 

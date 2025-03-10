@@ -1,74 +1,13 @@
 use super::*;
 use bevy::ecs::system::SystemParam;
 
-pub fn set_path_positions(
-    camera: Res<UniversalCamera>,
-    mut polylines: ResMut<Assets<Polyline>>,
-    system: Res<System>,
-    query: Query<(&ComputedPath, &PolylineHandle, Option<&ParentBody>)>,
-) {
-    let positions = system.state.planet_and_moon_positions;
-
-    for (ComputedPath(path), handle, parent) in query.iter() {
-        let line = polylines.get_mut(&handle.0).unwrap();
-        line.vertices.clear();
-        let parent_pos = convert_vec(
-            parent
-                .map(|&ParentBody(parent)| positions.get(parent))
-                .unwrap_or_default(),
-        );
-        for point in path {
-            let pos = (parent_pos + point) - convert_vec(camera.position.as_vec3());
-            line.vertices
-                // Move the lines closer to the camera for better stability on opengl.
-                .push((pos / camera.distance).as_vec3());
-        }
-    }
-}
-
-pub fn set_ship_path_positions(
-    camera: Res<UniversalCamera>,
-    mut polylines: ResMut<Assets<Polyline>>,
-    paths: Query<(&ShipPath, &PolylineHandle)>,
-    settings: Res<PathSettings>,
-    system: Res<System>,
-    reference_frame: Res<ReferenceFrameBody>,
-) {
-    let offset = if let Some(body) = reference_frame.0 {
-        system.state.planet_and_moon_positions.get(body)
-    } else {
-        Default::default()
-    };
-
-    for (path, handle) in paths.iter() {
-        let line = polylines.get_mut(&handle.0).unwrap();
-        line.vertices.clear();
-
-        let decimation: usize = settings.decimation;
-        let system_system: nbody_simd::System = system.system;
-
-        for point in path
-            .batches
-            .iter()
-            .flat_map(|batch| &batch.render_positions)
-        //.step_by(settings.decimation)
-        //.take(settings.max_segments / settings.decimation)
-        {
-            let pos = (*point - camera.position) + offset;
-
-            line.vertices
-                // Move the lines closer to the camera for better stability on opengl.
-                .push(convert_vec(pos / camera.distance).as_vec3());
-        }
-    }
-}
-
 #[derive(SystemParam)]
 pub struct UiParams<'w, 's> {
     cursor_on_ui_element: Res<'w, CursorOnUiElement>,
     contexts: EguiContexts<'w, 's>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn get_closest_path_point(
     mut ui_params: UiParams,
     camera: Res<UniversalCamera>,
@@ -80,14 +19,13 @@ pub fn get_closest_path_point(
     mut polyline_materials: ResMut<Assets<PolylineMaterial>>,
     mut polylines: ResMut<Assets<Polyline>>,
     mut commands: Commands,
-    settings: Res<PathSettings>,
     reference_frame: Res<ReferenceFrameBody>,
     system: Res<System>,
     mut color_chooser: ResMut<ColorChooser>,
     sphere_mesh: Res<SphereMesh>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let mut cursor_position =
+    let cursor_position =
         if let Some(cursor_position) = primary_window.and_then(|window| window.cursor_position()) {
             cursor_position
         } else {
@@ -117,8 +55,6 @@ pub fn get_closest_path_point(
     let cone_dir = ray.direction.as_vec3().as_dvec3();
 
     let reference_frame: &ReferenceFrameBody = &reference_frame;
-    let decimation = settings.selection_decimation;
-    let system: &System = &system;
     let camera: &UniversalCamera = &camera;
 
     let picked_position = paths
@@ -155,14 +91,12 @@ pub fn get_closest_path_point(
                             .adapted_positions
                             .iter()
                             .enumerate()
-                            .map(move |(i, pos)| (batch_id, i, path, pos))
-                            .step_by(decimation),
+                            .map(move |(i, pos)| (batch_id, i, path, pos)),
                     )
                 })
                 .flatten()
-                .take(settings.max_segments)
         })
-        .map(|((batch_id, i, path, &pos))| {
+        .map(|(batch_id, i, path, &pos)| {
             let relative = convert_vec((pos - camera.position) + offset);
             let dir = relative.normalize();
             let closeness = dir.dot(cone_dir);
@@ -171,20 +105,21 @@ pub fn get_closest_path_point(
         .max_by_key(|&(.., cosine_angle)| ordered_float::OrderedFloat(cosine_angle))
         .filter(|&(.., cosine_angle)| cosine_angle > 0.9995);
 
-    if let Some((batch_id, index, origin_path, x)) = picked_position {
+    if let Some((batch_id, index, origin_path, _)) = picked_position {
         if buttons.just_pressed(MouseButton::Left) {
+            let batch = &origin_path.batches[batch_id];
+
             let start = origin_path.start
                 + origin_path
                     .batches
                     .iter()
                     .take(batch_id)
-                    .map(|batch| batch.step * batch.positions.len() as f64)
-                    .sum::<f64>();
+                    .map(|batch| batch.duration())
+                    .sum::<f64>()
+                + index as f64 * batch.step;
             if reference_frame.0.is_none() {
                 time.0 = start;
             }
-
-            let batch = &origin_path.batches[batch_id];
 
             let vel = batch.velocities[index];
             let pos = batch.positions[index];
@@ -214,14 +149,14 @@ pub fn get_closest_path_point(
                     TrajectoryReceiver {
                         expected_round: 0,
                         inner: output_rx,
+                        burn_tx,
                     },
-                    BurnTx(burn_tx),
                     ShipPath {
                         start,
                         start_pos: pos,
                         start_vel: vel,
                         batches: Vec::new(),
-                        total_duration: 0.0
+                        total_duration: 0.0,
                     },
                     Burn {
                         vector: Default::default(),
@@ -269,7 +204,7 @@ pub fn trajectory_handles(
         return;
     }
 
-    let mut cursor_position =
+    let cursor_position =
         if let Some(cursor_position) = primary_window.and_then(|window| window.cursor_position()) {
             cursor_position
         } else {
@@ -302,12 +237,9 @@ pub fn trajectory_handles(
 }
 
 pub fn adjust_trajectory(
-    render_cam: Single<(&Camera, &GlobalTransform)>,
-    query: Query<(&Transform, &AssociatedTrajectory)>,
-    primary_window: Option<Single<&Window>>,
     buttons: Res<ButtonInput<MouseButton>>,
-    mut cursor_on_ui_element: Res<CursorOnUiElement>,
-    mut burns: Query<(&mut ShipPath, &mut Burn, &BurnTx, &mut TrajectoryReceiver)>,
+    cursor_on_ui_element: Res<CursorOnUiElement>,
+    mut burns: Query<(&mut ShipPath, &mut Burn, &mut TrajectoryReceiver)>,
     mut mouse_motion_events: EventReader<MouseMotion>,
 ) {
     if !buttons.pressed(MouseButton::Left) {
@@ -320,7 +252,7 @@ pub fn adjust_trajectory(
         return;
     };
 
-    let (mut path, mut burn, burn_tx, mut trajec) = burns.get_mut(associated_trajectory).unwrap();
+    let (mut path, mut burn, mut trajec) = burns.get_mut(associated_trajectory).unwrap();
 
     let mut delta = Vec2::ZERO;
     for event in mouse_motion_events.read() {
@@ -334,8 +266,8 @@ pub fn adjust_trajectory(
     burn.vector.x += delta.x as f64 * 1000.0;
     let new_round = trajec.expected_round + 1;
     trajec.expected_round = new_round;
-    burn_tx.0.send((burn.vector, new_round)).unwrap();
-    path.batches.clear();
+    trajec.burn_tx.send((burn.vector, new_round)).unwrap();
+    path.clear();
 }
 
 pub fn adapt_batch_to_reference_frame(
@@ -377,11 +309,23 @@ pub fn adapt_paths_to_new_reference_frame(
     }
 
     for mut path in query.iter_mut() {
-        let mut time = path.start;
+        path.total_duration = 0.0;
 
-        for batch in &mut path.batches {
-            adapt_batch_to_reference_frame(time, batch, &reference_frame, &system);
-            time += batch.positions.len() as f64 * batch.step;
+        let ShipPath {
+            batches,
+            total_duration,
+            start,
+            ..
+        } = &mut *path;
+
+        for batch in batches {
+            adapt_batch_to_reference_frame(
+                *start + *total_duration,
+                batch,
+                &reference_frame,
+                &system,
+            );
+            *total_duration += batch.duration();
         }
     }
 }
@@ -392,10 +336,10 @@ fn decimate(points: &[UniversalPos], output: &mut Vec<UniversalPos>) {
     let mut last = points[1];
 
     for &point in &points[2..] {
-        let new_vector = convert_vec(point - *output.last().unwrap()).normalize();
-        if new_vector.dot(vector) <= 0.5_f64.to_radians().cos() {
+        let new_vector = convert_vec(point - last).normalize();
+        if new_vector.dot(vector) <= 0.05_f64.to_radians().cos() {
             output.push(last);
-            vector = convert_vec(point - last).normalize();
+            vector = new_vector;
         }
 
         last = point;

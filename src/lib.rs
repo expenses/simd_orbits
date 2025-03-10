@@ -843,12 +843,12 @@ impl System {
 
             let parent = self.moon_parent_swizzles[index - 8];
 
-            (orbital_position::<Simd<f64, 64>, _>(body, time, sleef::f64x::sincos_u35)
+            orbital_position::<Simd<f64, 64>, _>(body, time, sleef::f64x::sincos_u35)
                 + orbital_position::<Simd<f64, 64>, _>(
                     OrbitParams::from_array([self.planets.get(parent); 64]),
                     time,
                     sleef::f64x::sincos_u35,
-                ))
+                )
         }
     }
 
