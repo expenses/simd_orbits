@@ -34,6 +34,12 @@ struct FollowedBody(Option<usize>);
 struct ReferenceFrameBody(Option<usize>);
 
 #[derive(Resource)]
+struct SphereMesh(Handle<Mesh>);
+
+#[derive(Resource, Default)]
+struct SelectedBurn(Option<Entity>);
+
+#[derive(Resource)]
 struct UniversalCamera {
     center: UniversalPos,
     position: UniversalPos,
@@ -97,6 +103,7 @@ fn main() {
         .init_resource::<SystemTime>()
         .init_resource::<FollowedBody>()
         .init_resource::<ReferenceFrameBody>()
+        .init_resource::<SelectedBurn>()
         .add_plugins(DefaultPlugins)
         .add_plugins(PolylinePlugin)
         .add_plugins(EguiPlugin)
@@ -254,9 +261,6 @@ fn set_universal_positions(
     }
 }
 
-#[derive(Resource)]
-struct SphereMesh(Handle<Mesh>);
-
 struct PathBatch {
     positions: Vec<UniversalPos>,
     adapted_positions: Vec<UniversalPos>,
@@ -412,7 +416,7 @@ fn trajectory_calculator(
         let seconds_to_nearest_body = nearest / convert_vec(calc_state.vel).length();
 
         // Large timesteps are allowed but we should only reach 90% of the way to the nearest body with them.
-        let timestep = ((seconds_to_nearest_body / batch_size as f64) * 0.9).max(1.0);
+        let timestep = ((seconds_to_nearest_body / batch_size as f64) * 0.9).clamp(1.0, 24.0 * 60.0 * 60.0);
         let mut collides = false;
         for i in 0..batch_size {
             positions.push(calc_state.pos);

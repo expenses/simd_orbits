@@ -9,6 +9,7 @@ pub fn update_ui(
     mut burns: Query<(Entity, &mut ShipPath, &mut Burn, &mut TrajectoryReceiver)>,
     mut commands: Commands,
     mut path_settings: ResMut<PathSettings>,
+    mut selected_burn: ResMut<SelectedBurn>,
     system_bodies: Query<(&Name, &SystemBody)>,
 ) {
     egui::Window::new("Hello").show(contexts.ctx_mut(), |ui| {
@@ -18,11 +19,28 @@ pub fn update_ui(
         ));
         ui.add(egui::Slider::new(&mut time.0, 0.0..=100_000_000.0));
 
-        for (entity, mut path, mut burn, mut trajec) in burns.iter_mut() {
-            ui.label("Burn");
-            if ui.button("delete").clicked() {
-                commands.entity(entity).despawn();
+        ui.horizontal(|ui| {
+            if ui.button("follow none").clicked() {
+                followed.0 = None;
             }
+            if ui.button("No Ref").clicked() {
+                reference_frame.0 = None;
+            }
+            if ui.button("no burn select").clicked() {
+                selected_burn.0 = None;
+            }
+        });
+
+        for (entity, mut path, mut burn, mut trajec) in burns.iter_mut() {
+            ui.horizontal(|ui| {
+                ui.label("Burn");
+                if ui.button("select").clicked() {
+                    selected_burn.0 = Some(entity);
+                }
+                if ui.button("delete").clicked() {
+                    commands.entity(entity).despawn();
+                }
+            });
 
             let mut updated = ui
                 .add(egui::Slider::new(
@@ -48,13 +66,6 @@ pub fn update_ui(
                 trajec.burn_tx.send((burn.vector, new_round)).unwrap();
                 path.clear();
             }
-        }
-
-        if ui.button("None").clicked() {
-            followed.0 = None;
-        }
-        if ui.button("No Ref").clicked() {
-            reference_frame.0 = None;
         }
 
         for (name, body) in system_bodies.iter() {

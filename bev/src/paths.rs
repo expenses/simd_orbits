@@ -25,6 +25,10 @@ pub fn get_closest_path_point(
     sphere_mesh: Res<SphereMesh>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    if !buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
+
     let cursor_position =
         if let Some(cursor_position) = primary_window.and_then(|window| window.cursor_position()) {
             cursor_position
@@ -57,6 +61,8 @@ pub fn get_closest_path_point(
     let reference_frame: &ReferenceFrameBody = &reference_frame;
     let camera: &UniversalCamera = &camera;
 
+    let cone_angle = 0.2_f64.to_radians();
+
     let picked_position = paths
         .iter()
         .flat_map(|path| {
@@ -64,19 +70,12 @@ pub fn get_closest_path_point(
                 .iter()
                 .enumerate()
                 .flat_map(move |(batch_id, batch)| {
-                    let min = convert_vec(batch.min - camera.position);
-                    let max = convert_vec(batch.max - camera.position);
+                    let min = convert_vec((batch.min - camera.position) + offset);
+                    let max = convert_vec((batch.max - camera.position) + offset);
 
-                    let center = (min + max) / 2.0;
-                    let radius = (max - min).length();
-
-                    /*let aabb = bevy::math::bounding::Aabb3d {
-                        min: (convert_vec(batch.min - camera.position) / camera.distance)
-                            .as_vec3()
-                            .into(),
-                        max: (convert_vec(batch.max - camera.position) / camera.distance)
-                            .as_vec3()
-                            .into(),
+                    let aabb = bevy::math::bounding::Aabb3d {
+                        min: (min / camera.distance).as_vec3().into(),
+                        max: (max / camera.distance).as_vec3().into(),
                     };
 
                     if bevy::math::bounding::RayCast3d::from_ray(ray, 1000.0)
@@ -84,7 +83,7 @@ pub fn get_closest_path_point(
                         .is_none()
                     {
                         return None;
-                    }*/
+                    }
 
                     Some(
                         batch
@@ -99,94 +98,90 @@ pub fn get_closest_path_point(
         .map(|(batch_id, i, path, &pos)| {
             let relative = convert_vec((pos - camera.position) + offset);
             let dir = relative.normalize();
-            let closeness = dir.dot(cone_dir);
-            (batch_id, i, path, closeness)
+            let cosine_angle = dir.dot(cone_dir);
+            (batch_id, i, path, cosine_angle)
         })
         .max_by_key(|&(.., cosine_angle)| ordered_float::OrderedFloat(cosine_angle))
-        .filter(|&(.., cosine_angle)| cosine_angle > 0.9995);
+        .filter(|&(.., cosine_angle)| cosine_angle > cone_angle.cos());
 
     if let Some((batch_id, index, origin_path, _)) = picked_position {
-        if buttons.just_pressed(MouseButton::Left) {
-            let batch = &origin_path.batches[batch_id];
+        let batch = &origin_path.batches[batch_id];
 
-            let start = origin_path.start
-                + origin_path
-                    .batches
-                    .iter()
-                    .take(batch_id)
-                    .map(|batch| batch.duration())
-                    .sum::<f64>()
-                + index as f64 * batch.step;
-            if reference_frame.0.is_none() {
-                time.0 = start;
-            }
-
-            let vel = batch.velocities[index];
-            let pos = batch.positions[index];
-
-            let (output_tx, output_rx) = sync_channel(100);
-            let (burn_tx, burn_rx) = sync_channel(10);
-
-            std::thread::spawn(move || {
-                trajectory_calculator(
-                    output_tx,
-                    burn_rx,
-                    start,
-                    pos,
-                    vel,
-                    nbody_simd::System::sol(),
-                );
-            });
-
-            let material = MeshMaterial3d(materials.add(StandardMaterial {
-                perceptual_roughness: 1.0,
-                base_color_texture: None,
-                unlit: true,
-                ..Default::default()
-            }));
-            let trajectory = commands
-                .spawn((
-                    TrajectoryReceiver {
-                        expected_round: 0,
-                        inner: output_rx,
-                        burn_tx,
-                    },
-                    ShipPath {
-                        start,
-                        start_pos: pos,
-                        start_vel: vel,
-                        batches: Vec::new(),
-                        total_duration: 0.0,
-                    },
-                    Burn {
-                        vector: Default::default(),
-                    },
-                    PolylineBundle {
-                        polyline: PolylineHandle(polylines.add(Polyline::default())),
-                        material: PolylineMaterialHandle(polyline_materials.add(
-                            PolylineMaterial {
-                                width: 1.0,
-                                color: color_chooser.next(),
-                                perspective: false,
-                                ..Default::default()
-                            },
-                        )),
-                        ..Default::default()
-                    },
-                ))
-                .id();
-
-            /*let x_pos = commands.spawn((
-                AssociatedTrajectory(trajectory),
-                Mesh3d(sphere_mesh.0.clone()),
-                material.clone(),
-                Transform::IDENTITY,
-                UniversalObjectPos {
-                    pos,
-                    offset: DVec3::new(5.0, 0.0, 0.0),
-                },
-            ));*/
+        let start = origin_path.start
+            + origin_path
+                .batches
+                .iter()
+                .take(batch_id)
+                .map(|batch| batch.duration())
+                .sum::<f64>()
+            + index as f64 * batch.step;
+        if reference_frame.0.is_none() {
+            time.0 = start;
         }
+
+        let vel = batch.velocities[index];
+        let pos = batch.positions[index];
+
+        let (output_tx, output_rx) = sync_channel(100);
+        let (burn_tx, burn_rx) = sync_channel(10);
+
+        std::thread::spawn(move || {
+            trajectory_calculator(
+                output_tx,
+                burn_rx,
+                start,
+                pos,
+                vel,
+                nbody_simd::System::sol(),
+            );
+        });
+
+        let material = MeshMaterial3d(materials.add(StandardMaterial {
+            perceptual_roughness: 1.0,
+            base_color_texture: None,
+            unlit: true,
+            ..Default::default()
+        }));
+        let trajectory = commands
+            .spawn((
+                TrajectoryReceiver {
+                    expected_round: 0,
+                    inner: output_rx,
+                    burn_tx,
+                },
+                ShipPath {
+                    start,
+                    start_pos: pos,
+                    start_vel: vel,
+                    batches: Vec::new(),
+                    total_duration: 0.0,
+                },
+                Burn {
+                    vector: Default::default(),
+                },
+                PolylineBundle {
+                    polyline: PolylineHandle(polylines.add(Polyline::default())),
+                    material: PolylineMaterialHandle(polyline_materials.add(PolylineMaterial {
+                        width: 1.0,
+                        color: color_chooser.next(),
+                        perspective: false,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            ))
+            .id();
+
+        /*let x_pos = commands.spawn((
+            AssociatedTrajectory(trajectory),
+            Mesh3d(sphere_mesh.0.clone()),
+            material.clone(),
+            Transform::IDENTITY,
+            UniversalObjectPos {
+                pos,
+                offset: DVec3::new(5.0, 0.0, 0.0),
+            },
+        ));*/
     }
 }
 
@@ -337,7 +332,7 @@ fn decimate(points: &[UniversalPos], output: &mut Vec<UniversalPos>) {
 
     for &point in &points[2..] {
         let new_vector = convert_vec(point - last).normalize();
-        if new_vector.dot(vector) <= 0.05_f64.to_radians().cos() {
+        if new_vector.dot(vector) <= 0.1_f64.to_radians().cos() {
             output.push(last);
             vector = new_vector;
         }
