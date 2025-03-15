@@ -220,6 +220,13 @@ impl<T: std::ops::Add<Output = T> + std::ops::Mul<Output = T> + Copy> Vec3<T> {
     }
 }
 
+impl Vec3<f64> {
+    #[inline]
+    pub fn length(&self) -> f64 {
+        self.length_squared().sqrt()
+    }
+}
+
 impl<T: std::ops::Add<Output = T>> std::ops::Add<Self> for Vec3<T> {
     type Output = Self;
 

@@ -304,7 +304,7 @@ fn receive_trajectories(
     system: Res<System>,
 ) {
     for (mut path, recv) in query.iter_mut() {
-        for batch in recv.inner.try_iter() {
+        while let Ok(batch) = recv.inner.try_recv() {
             if batch.round != recv.expected_round {
                 path.clear();
                 continue;
@@ -337,9 +337,10 @@ struct TrajectoryReceiver {
     expected_round: usize,
     inner: Receiver<TrajectoryBatch>,
     burn_tx: Sender<(nbody_simd::Vec3<f64>, usize)>,
+    handle: bevy::tasks::Task<()>,
 }
 
-use std::sync::mpmc::{Receiver, Sender, sync_channel};
+use async_channel::{Receiver, Sender, bounded};
 
 struct TrajectoryBatch {
     round: usize,
@@ -349,7 +350,7 @@ struct TrajectoryBatch {
     step: f64,
 }
 
-fn trajectory_calculator(
+async fn trajectory_calculator(
     output: Sender<TrajectoryBatch>,
     commands: Receiver<(nbody_simd::Vec3<f64>, usize)>,
     start: f64,
@@ -358,6 +359,7 @@ fn trajectory_calculator(
     system: nbody_simd::System,
 ) {
     let batch_size = 10_000;
+    let accel_per_sec = 9.8;
 
     struct CalculatorState {
         pos: UniversalPos,
@@ -365,41 +367,51 @@ fn trajectory_calculator(
         iteration: usize,
         round: usize,
         time: f64,
+        burn_dir: nbody_simd::Vec3<f64>,
+        burn_delta_v: f64,
     }
 
     let mut calc_state = CalculatorState {
         pos: starting_pos,
         vel: starting_vel,
-        iteration: 0,
-        round: 0,
         time: start,
+        iteration: Default::default(),
+        round: Default::default(),
+        burn_dir: Default::default(),
+        burn_delta_v: Default::default(),
     };
 
     let mut wait_for_next = true;
 
     loop {
         if wait_for_next {
-            let (burn, new_round) = if let Ok((burn, new_round)) = commands.recv() {
+            let (burn, new_round) = if let Ok((burn, new_round)) = commands.recv().await {
                 (burn, new_round)
             } else {
                 return;
             };
+            let burn_delta_v = burn.length();
             calc_state = CalculatorState {
                 pos: starting_pos,
                 vel: starting_vel + burn,
                 iteration: 0,
                 round: new_round,
                 time: start,
+                burn_dir: burn / burn_delta_v,
+                burn_delta_v,
             };
         }
 
         while let Ok((burn, new_round)) = commands.try_recv() {
+            let burn_delta_v = burn.length();
             calc_state = CalculatorState {
                 pos: starting_pos,
-                vel: starting_vel + burn,
+                vel: starting_vel,
                 iteration: 0,
                 round: new_round,
                 time: start,
+                burn_dir: burn / burn_delta_v,
+                burn_delta_v,
             };
         }
 
@@ -416,7 +428,8 @@ fn trajectory_calculator(
         let seconds_to_nearest_body = nearest / convert_vec(calc_state.vel).length();
 
         // Large timesteps are allowed but we should only reach 90% of the way to the nearest body with them.
-        let timestep = ((seconds_to_nearest_body / batch_size as f64) * 0.9).clamp(1.0, 24.0 * 60.0 * 60.0);
+        let timestep =
+            ((seconds_to_nearest_body / batch_size as f64) * 0.9).clamp(1.0, 24.0 * 60.0 * 60.0);
         let mut collides = false;
         for i in 0..batch_size {
             positions.push(calc_state.pos);
@@ -426,19 +439,30 @@ fn trajectory_calculator(
                 collides = true;
                 break;
             }
-            calc_state.vel += state.acceleration_at(calc_state.pos.as_vec3()) * timestep;
+
+            let mut accel = state.acceleration_at(calc_state.pos.as_vec3()) * timestep;
+
+            if calc_state.burn_delta_v > 0.0 {
+                let burn_amount = (timestep * accel_per_sec).min(calc_state.burn_delta_v);
+                accel += calc_state.burn_dir * burn_amount;
+                calc_state.burn_delta_v -= burn_amount;
+            }
+
+            calc_state.vel += accel;
             calc_state.pos += calc_state.vel * timestep;
             state = system.state_at(calc_state.time + timestep * (i + 1) as f64);
         }
         calc_state.iteration += batch_size;
         calc_state.time += batch_size as f64 * timestep;
-        let _ = output.send(TrajectoryBatch {
-            round: calc_state.round,
-            positions,
-            velocities,
-            collides,
-            step: timestep,
-        });
+        let _ = output
+            .send(TrajectoryBatch {
+                round: calc_state.round,
+                positions,
+                velocities,
+                collides,
+                step: timestep,
+            })
+            .await;
 
         wait_for_next = calc_state.iteration >= 1_000_000 || collides;
     }
@@ -449,8 +473,8 @@ struct CursorOnUiElement(Option<Entity>);
 
 #[test]
 fn test_trajectory_thread() {
-    let (output_tx, output_rx) = sync_channel(100);
-    let (burn_tx, burn_rx) = sync_channel(100);
+    let (output_tx, output_rx) = bounded(100);
+    let (burn_tx, burn_rx) = bounded(100);
     let pos = UniversalPos::new_3(57_909_048_000.0 / 2.0, 0.0, 0.0);
     let vel = nbody_simd::Vec3::new(0.0, 0.0, 100000.0);
 

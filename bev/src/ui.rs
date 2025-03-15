@@ -63,7 +63,7 @@ pub fn update_ui(
             if updated {
                 let new_round = trajec.expected_round + 1;
                 trajec.expected_round = new_round;
-                trajec.burn_tx.send((burn.vector, new_round)).unwrap();
+                trajec.burn_tx.try_send((burn.vector, new_round)).unwrap();
                 path.clear();
             }
         }

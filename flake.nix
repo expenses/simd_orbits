@@ -18,12 +18,14 @@
     flake-utils.lib.eachDefaultSystem (
       system: let
         pkgs = nixpkgs.legacyPackages.${system};
-        craneLib = (crane.mkLib pkgs).overrideToolchain (with fenix.packages.${system};
+        toolchain = (with fenix.packages.${system};
           combine [
             latest.rustc
             latest.cargo
             targets.wasm32-unknown-unknown.latest.rust-std
+            #latest.rust-src
           ]);
+        craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
       in {
         devShells.default = with pkgs;
           mkShell rec {
@@ -51,8 +53,8 @@
             LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
           };
 
-          packages = rec {
-            wasm = craneLib.buildPackage rec {
+        packages = rec {
+          wasm = craneLib.buildPackage rec {
             name = "bev";
             src = craneLib.cleanCargoSource ./.;
             cargoArtifacts = craneLib.buildDepsOnly {
@@ -60,7 +62,20 @@
               inherit src CARGO_BUILD_TARGET;
             };
             CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-            cargoExtraArgs = "--example=bev";
+            cargoExtraArgs = "--package=bev";
+            doCheck = false;
+          };
+          wasm2 =  craneLib.buildPackage rec {
+            name = "bev";
+            src = craneLib.cleanCargoSource ./.;
+            cargoArtifacts = craneLib.buildDepsOnly {
+              name = "bev";
+              inherit src CARGO_BUILD_TARGET RUSTFLAGS;
+              cargoExtraArgs = "-Z build-std=std,panic_abort";
+            };
+            CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+            cargoExtraArgs = "--package=bev -Z build-std=std,panic_abort";
+            RUSTFLAGS="-C target-feature=+atomics,+bulk-memory";
             doCheck = false;
           };
 
@@ -71,9 +86,9 @@
               echo ${binaryen}/bin/wasm-opt -Oz -o $out/bev_bg.wasm $out/bev_bg.wasm
               ${binaryen}/bin/wasm-opt -Oz -o $out/bev_bg.wasm $out/bev_bg.wasm
               cp ${./index.html} $out/index.html
-              cp -r ${./assets} $out/assets
+              cp -r ${./bev/assets} $out/assets
             '';
-          };
+        };
       }
     );
 }

@@ -1,5 +1,6 @@
 use super::*;
 use bevy::ecs::system::SystemParam;
+use bevy::tasks::AsyncComputeTaskPool;
 
 #[derive(SystemParam)]
 pub struct UiParams<'w, 's> {
@@ -122,19 +123,19 @@ pub fn get_closest_path_point(
         let vel = batch.velocities[index];
         let pos = batch.positions[index];
 
-        let (output_tx, output_rx) = sync_channel(100);
-        let (burn_tx, burn_rx) = sync_channel(10);
+        let task_pool = AsyncComputeTaskPool::get();
 
-        std::thread::spawn(move || {
-            trajectory_calculator(
-                output_tx,
-                burn_rx,
-                start,
-                pos,
-                vel,
-                nbody_simd::System::sol(),
-            );
-        });
+        let (output_tx, output_rx) = bounded(100);
+        let (burn_tx, burn_rx) = bounded(10);
+
+        let handle = task_pool.spawn(trajectory_calculator(
+            output_tx,
+            burn_rx,
+            start,
+            pos,
+            vel,
+            nbody_simd::System::sol(),
+        ));
 
         let material = MeshMaterial3d(materials.add(StandardMaterial {
             perceptual_roughness: 1.0,
@@ -148,6 +149,7 @@ pub fn get_closest_path_point(
                     expected_round: 0,
                     inner: output_rx,
                     burn_tx,
+                    handle,
                 },
                 ShipPath {
                     start,
@@ -261,7 +263,7 @@ pub fn adjust_trajectory(
     burn.vector.x += delta.x as f64 * 1000.0;
     let new_round = trajec.expected_round + 1;
     trajec.expected_round = new_round;
-    trajec.burn_tx.send((burn.vector, new_round)).unwrap();
+    trajec.burn_tx.try_send((burn.vector, new_round)).unwrap();
     path.clear();
 }
 
