@@ -31,7 +31,7 @@ pub fn update_ui(
             }
         });
 
-        for (entity, mut path, mut burn, mut trajec) in burns.iter_mut() {
+        for (entity, ..) in burns.iter_mut() {
             ui.horizontal(|ui| {
                 ui.label("Burn");
                 if ui.button("select").clicked() {
@@ -39,8 +39,15 @@ pub fn update_ui(
                 }
                 if ui.button("delete").clicked() {
                     commands.entity(entity).despawn();
+                    if selected_burn.0 == Some(entity) {
+                        selected_burn.0 = None;
+                    }
                 }
             });
+        }
+
+        if let Some(burn) = selected_burn.0 {
+            let (_, mut path, mut burn, mut trajec) = burns.get_mut(burn).unwrap();
 
             let mut updated = ui
                 .add(egui::Slider::new(

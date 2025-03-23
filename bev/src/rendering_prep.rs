@@ -33,14 +33,9 @@ pub fn set_body_positions(
     let positions = system.state.planet_and_moon_positions;
 
     for (body, mut transform, radius) in query.iter_mut() {
-        let pos = positions.get(body.0) - camera.position.as_vec3();
-        let pos = convert_vec(pos / camera.distance);
-        let distance = pos.length();
-        let pos = pos.as_vec3();
-
-        *transform = transform.with_translation(pos).with_scale(Vec3::splat(
-            (radius.0 / camera.distance).max(distance / 200.0) as f32,
-        ));
+        *transform = create_transform(positions.get(body.0).into(), &camera, |distance| {
+            (radius.0 / camera.distance).max(distance / 200.0)
+        });
     }
 }
 
@@ -79,14 +74,9 @@ pub fn set_star_positions(
     camera: Res<UniversalCamera>,
 ) {
     for (mut transform, radius) in query.iter_mut() {
-        let pos = UniversalPos::default() - camera.position;
-        let pos = convert_vec(pos / camera.distance);
-        let distance = pos.length();
-        *transform = transform
-            .with_translation(pos.as_vec3())
-            .with_scale(Vec3::splat(
-                (radius.0 / camera.distance).max(distance / 75.0) as f32,
-            ));
+        *transform = create_transform(UniversalPos::default(), &camera, |distance| {
+            (radius.0 / camera.distance).max(distance / 75.0)
+        });
     }
 }
 

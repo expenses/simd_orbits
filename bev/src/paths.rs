@@ -24,12 +24,9 @@ pub fn get_closest_path_point(
     system: Res<System>,
     mut color_chooser: ResMut<ColorChooser>,
     sphere_mesh: Res<SphereMesh>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut burn_preview_location: Single<&mut Transform, With<BurnPreviewLocation>>,
+    mut selected_burn: ResMut<SelectedBurn>,
 ) {
-    if !buttons.just_pressed(MouseButton::Left) {
-        return;
-    }
-
     let cursor_position =
         if let Some(cursor_position) = primary_window.and_then(|window| window.cursor_position()) {
             cursor_position
@@ -105,86 +102,89 @@ pub fn get_closest_path_point(
         .max_by_key(|&(.., cosine_angle)| ordered_float::OrderedFloat(cosine_angle))
         .filter(|&(.., cosine_angle)| cosine_angle > cone_angle.cos());
 
-    if let Some((batch_id, index, origin_path, _)) = picked_position {
-        let batch = &origin_path.batches[batch_id];
+    let (batch_id, index, origin_path, _) = if let Some(path) = picked_position {
+        path
+    } else {
+        **burn_preview_location = (*burn_preview_location).with_scale(Default::default());
 
-        let start = origin_path.start
-            + origin_path
-                .batches
-                .iter()
-                .take(batch_id)
-                .map(|batch| batch.duration())
-                .sum::<f64>()
-            + index as f64 * batch.step;
-        if reference_frame.0.is_none() {
-            time.0 = start;
-        }
+        return;
+    };
 
-        let vel = batch.velocities[index];
-        let pos = batch.positions[index];
+    let batch = &origin_path.batches[batch_id];
 
-        let task_pool = AsyncComputeTaskPool::get();
+    let start = origin_path.start
+        + origin_path
+            .batches
+            .iter()
+            .take(batch_id)
+            .map(|batch| batch.duration())
+            .sum::<f64>()
+        + index as f64 * batch.step;
 
-        let (output_tx, output_rx) = bounded(100);
-        let (burn_tx, burn_rx) = bounded(10);
-
-        let handle = task_pool.spawn(trajectory_calculator(
-            output_tx,
-            burn_rx,
-            start,
-            pos,
-            vel,
-            nbody_simd::System::sol(),
-        ));
-
-        let material = MeshMaterial3d(materials.add(StandardMaterial {
-            perceptual_roughness: 1.0,
-            base_color_texture: None,
-            unlit: true,
-            ..Default::default()
-        }));
-        let trajectory = commands
-            .spawn((
-                TrajectoryReceiver {
-                    expected_round: 0,
-                    inner: output_rx,
-                    burn_tx,
-                    handle,
-                },
-                ShipPath {
-                    start,
-                    start_pos: pos,
-                    start_vel: vel,
-                    batches: Vec::new(),
-                    total_duration: 0.0,
-                },
-                Burn {
-                    vector: Default::default(),
-                },
-                PolylineBundle {
-                    polyline: PolylineHandle(polylines.add(Polyline::default())),
-                    material: PolylineMaterialHandle(polyline_materials.add(PolylineMaterial {
-                        width: 1.0,
-                        color: color_chooser.next(),
-                        perspective: false,
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-            ))
-            .id();
-
-        /*let x_pos = commands.spawn((
-            AssociatedTrajectory(trajectory),
-            Mesh3d(sphere_mesh.0.clone()),
-            material.clone(),
-            Transform::IDENTITY,
-            UniversalObjectPos {
-                pos,
-                offset: DVec3::new(5.0, 0.0, 0.0),
-            },
-        ));*/
+    if buttons.just_pressed(MouseButton::Right) {
+        time.0 = start;
+        return;
     }
+
+    let vel = batch.velocities[index];
+    let pos = batch.positions[index];
+
+    **burn_preview_location = create_transform(
+        batch.adapted_positions[index] + offset,
+        &camera,
+        |distance| distance / 100.0,
+    );
+
+    if !buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let task_pool = AsyncComputeTaskPool::get();
+
+    let (output_tx, output_rx) = bounded(100);
+    let (burn_tx, burn_rx) = bounded(10);
+
+    let handle = task_pool.spawn(trajectory_calculator(
+        output_tx,
+        burn_rx,
+        start,
+        pos,
+        vel,
+        nbody_simd::System::sol(),
+    ));
+
+    let trajectory = commands
+        .spawn((
+            TrajectoryReceiver {
+                expected_round: 0,
+                inner: output_rx,
+                burn_tx,
+                handle,
+            },
+            ShipPath {
+                start,
+                start_pos: pos,
+                start_vel: vel,
+                batches: Vec::new(),
+                total_duration: 0.0,
+            },
+            Burn {
+                vector: Default::default(),
+            },
+            PolylineBundle {
+                polyline: PolylineHandle(polylines.add(Polyline::default())),
+                material: PolylineMaterialHandle(polyline_materials.add(PolylineMaterial {
+                    width: 1.0,
+                    color: color_chooser.next(),
+                    perspective: false,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ))
+        .id();
+
+    selected_burn.0 = Some(trajectory);
 }
 
 #[derive(Component)]

@@ -78,6 +78,9 @@ struct SystemStar;
 
 use std::simd::Simd;
 
+#[derive(Component)]
+struct BurnPreviewLocation;
+
 fn main() {
     App::new()
         .insert_resource(ClearColor(Color::BLACK))
@@ -342,6 +345,7 @@ struct TrajectoryReceiver {
 
 use async_channel::{Receiver, Sender, bounded};
 
+#[derive(Debug)]
 struct TrajectoryBatch {
     round: usize,
     positions: Vec<UniversalPos>,
@@ -470,7 +474,7 @@ async fn trajectory_calculator(
 
 #[derive(Resource, Default)]
 struct CursorOnUiElement(Option<Entity>);
-
+/*
 #[test]
 fn test_trajectory_thread() {
     let (output_tx, output_rx) = bounded(100);
@@ -478,23 +482,42 @@ fn test_trajectory_thread() {
     let pos = UniversalPos::new_3(57_909_048_000.0 / 2.0, 0.0, 0.0);
     let vel = nbody_simd::Vec3::new(0.0, 0.0, 100000.0);
 
-    std::thread::spawn(move || {
-        trajectory_calculator(output_tx, burn_rx, 0.0, pos, vel, nbody_simd::System::sol());
-    });
+    let task_pool = bevy::tasks::TaskPool::new();
 
-    for i in 0..10 {
-        dbg!(output_rx.recv().unwrap().0);
-    }
+    task_pool.spawn(
+        trajectory_calculator(output_tx, burn_rx, 0.0, pos, vel, nbody_simd::System::sol())
+    ).detach();
 
-    burn_tx
-        .send((nbody_simd::Vec3::new(0.0, 50_000.0, 0.0), 1))
-        .unwrap();
+    task_pool.spawn(async move {
 
-    dbg!(());
+        for i in 0..10 {
+            dbg!(output_rx.recv_blocking().unwrap());
+        }
 
-    for i in 0..10 {
-        dbg!(output_rx.recv().unwrap().0);
-    }
+        burn_tx
+            .send_blocking((nbody_simd::Vec3::new(0.0, 50_000.0, 0.0), 1))
+            .unwrap();
 
-    panic!();
+        dbg!(());
+
+        for i in 0..10 {
+            dbg!(output_rx.recv_blocking().unwrap());
+        }
+
+        panic!();
+    }).
+}
+*/
+
+fn create_transform<S: Fn(f64) -> f64>(
+    pos: UniversalPos,
+    camera: &UniversalCamera,
+    scale: S,
+) -> Transform {
+    let pos = pos - camera.position;
+    let pos = convert_vec(pos / camera.distance);
+    let distance = pos.length();
+    let pos = pos.as_vec3();
+
+    Transform::from_translation(pos).with_scale(Vec3::splat(scale(distance) as f32))
 }
