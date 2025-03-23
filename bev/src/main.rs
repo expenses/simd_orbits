@@ -79,7 +79,10 @@ struct SystemStar;
 use std::simd::Simd;
 
 #[derive(Component)]
-struct BurnPreviewLocation;
+struct BurnPreviewPosition;
+
+#[derive(Component)]
+struct SelectedBurnPosition;
 
 fn main() {
     App::new()
@@ -119,6 +122,7 @@ fn main() {
                 set_universal_positions.after(update_camera),
                 set_body_positions.after(get_state).after(update_camera),
                 set_body_path_positions.after(update_camera),
+                set_selected_burn_position.after(update_camera),
                 set_ship_path_positions
                     .after(update_camera)
                     .after(get_state)

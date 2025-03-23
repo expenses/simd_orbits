@@ -26,7 +26,19 @@ pub fn setup(
     commands.insert_resource(SphereMesh(sphere_mesh.clone()));
 
     commands.spawn((
-        BurnPreviewLocation,
+        BurnPreviewPosition,
+        Mesh3d(sphere_mesh.clone()),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            perceptual_roughness: 1.0,
+            base_color_texture: None,
+            unlit: true,
+            ..Default::default()
+        })),
+        Transform::IDENTITY,
+    ));
+
+    commands.spawn((
+        SelectedBurnPosition,
         Mesh3d(sphere_mesh.clone()),
         MeshMaterial3d(materials.add(StandardMaterial {
             perceptual_roughness: 1.0,

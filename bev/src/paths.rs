@@ -24,7 +24,7 @@ pub fn get_closest_path_point(
     system: Res<System>,
     mut color_chooser: ResMut<ColorChooser>,
     sphere_mesh: Res<SphereMesh>,
-    mut burn_preview_location: Single<&mut Transform, With<BurnPreviewLocation>>,
+    mut burn_preview_position: Single<&mut Transform, With<BurnPreviewPosition>>,
     mut selected_burn: ResMut<SelectedBurn>,
 ) {
     let cursor_position =
@@ -105,12 +105,18 @@ pub fn get_closest_path_point(
     let (batch_id, index, origin_path, _) = if let Some(path) = picked_position {
         path
     } else {
-        **burn_preview_location = (*burn_preview_location).with_scale(Default::default());
+        **burn_preview_position = Transform::from_scale(Default::default());
 
         return;
     };
 
     let batch = &origin_path.batches[batch_id];
+
+    **burn_preview_position = create_transform(
+        batch.adapted_positions[index] + offset,
+        &camera,
+        |distance| distance / 100.0,
+    );
 
     let start = origin_path.start
         + origin_path
@@ -128,12 +134,6 @@ pub fn get_closest_path_point(
 
     let vel = batch.velocities[index];
     let pos = batch.positions[index];
-
-    **burn_preview_location = create_transform(
-        batch.adapted_positions[index] + offset,
-        &camera,
-        |distance| distance / 100.0,
-    );
 
     if !buttons.just_pressed(MouseButton::Left) {
         return;

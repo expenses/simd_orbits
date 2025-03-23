@@ -39,6 +39,37 @@ pub fn set_body_positions(
     }
 }
 
+pub fn set_selected_burn_position(
+    camera: Res<UniversalCamera>,
+    mut selected_burn_position: Single<&mut Transform, With<SelectedBurnPosition>>,
+    selected_burn: Res<SelectedBurn>,
+    burns: Query<&ShipPath>,
+    system: Res<System>,
+    reference_frame: Res<ReferenceFrameBody>,
+) {
+    let burn = if let Some(burn) = selected_burn
+        .0
+        .and_then(|selected_burn| burns.get(selected_burn).ok())
+    {
+        burn
+    } else {
+        return;
+    };
+
+    let offset = if let Some(body) = reference_frame.0 {
+        system.state.planet_and_moon_positions.get(body)
+            + get_reference_frame_offset(burn.start, &system, body, 0.0)
+                .next()
+                .unwrap()
+    } else {
+        Default::default()
+    };
+
+    **selected_burn_position = create_transform(burn.start_pos + offset, &camera, |distance| {
+        distance / 100.0
+    });
+}
+
 pub fn set_ship_path_positions(
     camera: Res<UniversalCamera>,
     mut polylines: ResMut<Assets<Polyline>>,
